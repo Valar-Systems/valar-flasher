@@ -1,0 +1,16 @@
+You usually don't need to touch this folder.
+
+The flasher downloads each product's factory bins from GitHub automatically and
+caches them here in a per-product subfolder, named by chip:
+
+    firmware/Ropener/esp32c3.factory.bin      (VAL3000)
+    firmware/Ropener/esp32c6.factory.bin      (VAL3100)
+    firmware/Glasscalibur/esp32c6.factory.bin
+    firmware/Generic board/esp32c3.factory.bin
+    ...
+
+Which products exist, and which GitHub repo + asset each pulls, is defined in
+../products.json — edit that to add a new product (no code change needed).
+
+Manual override: drop a bin at firmware/<Product>/<chip>.factory.bin and it's
+used until a newer GitHub release appears.

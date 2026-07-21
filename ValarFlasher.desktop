@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Valar Flasher
+Comment=Detect a VAL board and flash the selected firmware
+Exec=bash -c "cd \"$(dirname %k)\" && ./valar-flasher-linux.sh"
+Terminal=false
+Categories=Utility;

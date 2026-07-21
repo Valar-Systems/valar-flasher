@@ -1,0 +1,25 @@
+{
+  "default": "Ropener",
+  "products": {
+    "Ropener": {
+      "repo": "Valar-Systems/Ropener",
+      "assets": {
+        "esp32c3": "val3000",
+        "esp32c6": "val3100"
+      }
+    },
+    "Glasscalibur": {
+      "repo": "Valar-Systems/Glasscalibur",
+      "assets": {
+        "esp32c6": "glasscalibur"
+      }
+    },
+    "Generic board": {
+      "repo": "Valar-Systems/valar-motion",
+      "assets": {
+        "esp32c3": "val3000",
+        "esp32c6": "val3100"
+      }
+    }
+  }
+}

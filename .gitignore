@@ -1,0 +1,11 @@
+# Local Python env created by the launchers
+.venv/
+__pycache__/
+*.pyc
+
+# SECRET — never commit a GitHub token
+github_token.txt
+
+# Auto-downloaded firmware cache (pulled from GitHub releases at runtime)
+firmware/**/*.bin
+firmware/**/.release_tag
