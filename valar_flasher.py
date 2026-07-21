@@ -3,17 +3,17 @@
 Valar Flasher — plug in a VAL board, pick which firmware to install, and it
 flashes the right binary for that board's chip. No typing.
 
-Firmware source is SELECTABLE (dropdown) and defined in products.json next to
-this script — add a new product by editing that file, no code change:
+Firmware source is SELECTABLE (dropdown). The product list lives in products.json
+next to this script — the SINGLE SOURCE OF TRUTH. Add a product by editing that
+file (no code change). Schema:
 
-    {
-      "default": "Ropener",
+    { "default": "<name>",
       "products": {
-        "Ropener":       {"repo": "Valar-Systems/Ropener",     "assets": {"esp32c3": "val3000", "esp32c6": "val3100"}},
-        "Glasscalibur":  {"repo": "Valar-Systems/Glasscalibur","assets": {"esp32c6": "glasscalibur"}},
-        "Generic board": {"repo": "Valar-Systems/valar-motion", "assets": {"esp32c3": "val3000", "esp32c6": "val3100"}}
-      }
-    }
+        "<name>": {"repo": "owner/repo", "assets": {"<chip>": "<asset-name-substring>"}}
+      } }
+
+e.g. assets {"esp32c6": "val3100"} matches a release asset named
+Ropener-VAL3100.factory.bin. See the shipped products.json for live examples.
 
 For the selected product it checks that repo's latest GitHub release on launch and
 downloads the matching factory bins (offline? it uses whatever is cached). Then:
@@ -37,33 +37,35 @@ FLASH_BAUD = "921600"
 CHIP_LABEL = {"esp32c3": "ESP32-C3", "esp32c6": "ESP32-C6",
               "esp32c2": "ESP32-C2", "esp32s3": "ESP32-S3"}
 
-DEFAULT_PRODUCTS = {
+# products.json (next to this script) is the SINGLE SOURCE OF TRUTH for the
+# product list — add products THERE. The table below is only a minimal fallback
+# so the tool still flashes Ropener boards if products.json is ever missing or
+# corrupt; it is deliberately NOT a mirror of the full list.
+FALLBACK_PRODUCTS = {
     "default": "Ropener",
     "products": {
-        "Ropener":       {"repo": "Valar-Systems/Ropener",      "assets": {"esp32c3": "val3000", "esp32c6": "val3100"}},
-        "Glasscalibur":  {"repo": "Valar-Systems/Glasscalibur", "assets": {"esp32c6": "glasscalibur"}},
-        "Generic board": {"repo": "Valar-Systems/valar-motion", "assets": {"esp32c3": "val3000", "esp32c6": "val3100"}},
+        "Ropener": {"repo": "Valar-Systems/Ropener", "assets": {"esp32c3": "val3000", "esp32c6": "val3100"}},
     },
 }
 
 
 def load_products():
-    """Read products.json; create it from the default if missing."""
-    if not os.path.exists(PRODUCTS_FILE):
-        try:
-            with open(PRODUCTS_FILE, "w") as f:
-                json.dump(DEFAULT_PRODUCTS, f, indent=2)
-        except Exception:
-            pass
-        return DEFAULT_PRODUCTS
+    """Load the product list from products.json (the source of truth). If it's
+    missing or invalid, fall back to a minimal built-in default and warn —
+    without overwriting anything."""
     try:
         with open(PRODUCTS_FILE) as f:
             cfg = json.load(f)
         if cfg.get("products"):
             return cfg
-    except Exception:
-        pass
-    return DEFAULT_PRODUCTS
+        raise ValueError("no 'products' key")
+    except FileNotFoundError:
+        print("[valar-flasher] products.json not found next to the script — using a "
+              "minimal Ropener-only fallback. Restore products.json for the full list.")
+    except Exception as e:
+        print(f"[valar-flasher] products.json couldn't be read ({e}) — using a "
+              "minimal Ropener-only fallback.")
+    return FALLBACK_PRODUCTS
 
 
 # ---- GitHub firmware sync (per product) ------------------------------------
