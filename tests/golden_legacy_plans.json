@@ -1,0 +1,115 @@
+{
+ "Generic board": {
+  "chips": {
+   "esp32c3": {
+    "esptool": [
+     "--chip",
+     "esp32c3",
+     "--port",
+     "PORT",
+     "--baud",
+     "921600",
+     "--before",
+     "default_reset",
+     "--after",
+     "hard_reset",
+     "write_flash",
+     "0x0",
+     "Generic board/esp32c3.factory.bin"
+    ],
+    "file": "Generic board/esp32c3.factory.bin"
+   },
+   "esp32c6": {
+    "esptool": [
+     "--chip",
+     "esp32c6",
+     "--port",
+     "PORT",
+     "--baud",
+     "921600",
+     "--before",
+     "default_reset",
+     "--after",
+     "hard_reset",
+     "write_flash",
+     "0x0",
+     "Generic board/esp32c6.factory.bin"
+    ],
+    "file": "Generic board/esp32c6.factory.bin"
+   }
+  },
+  "downloads": [
+   "val3000.factory.bin",
+   "val3100.factory.bin"
+  ]
+ },
+ "Glasscalibur": {
+  "chips": {
+   "esp32c6": {
+    "esptool": [
+     "--chip",
+     "esp32c6",
+     "--port",
+     "PORT",
+     "--baud",
+     "921600",
+     "--before",
+     "default_reset",
+     "--after",
+     "hard_reset",
+     "write_flash",
+     "0x0",
+     "Glasscalibur/esp32c6.factory.bin"
+    ],
+    "file": "Glasscalibur/esp32c6.factory.bin"
+   }
+  },
+  "downloads": [
+   "Glasscalibur.factory.bin"
+  ]
+ },
+ "Ropener": {
+  "chips": {
+   "esp32c3": {
+    "esptool": [
+     "--chip",
+     "esp32c3",
+     "--port",
+     "PORT",
+     "--baud",
+     "921600",
+     "--before",
+     "default_reset",
+     "--after",
+     "hard_reset",
+     "write_flash",
+     "0x0",
+     "Ropener/esp32c3.factory.bin"
+    ],
+    "file": "Ropener/esp32c3.factory.bin"
+   },
+   "esp32c6": {
+    "esptool": [
+     "--chip",
+     "esp32c6",
+     "--port",
+     "PORT",
+     "--baud",
+     "921600",
+     "--before",
+     "default_reset",
+     "--after",
+     "hard_reset",
+     "write_flash",
+     "0x0",
+     "Ropener/esp32c6.factory.bin"
+    ],
+    "file": "Ropener/esp32c6.factory.bin"
+   }
+  },
+  "downloads": [
+   "Ropener-VAL3000.factory.bin",
+   "Ropener-VAL3100.factory.bin"
+  ]
+ }
+}

@@ -1,0 +1,52 @@
+{
+ "v": 1,
+ "why": "sha256 of every 64-hex and 40-char token-shaped run in the chip-select products' factory images that was found VERBATIM in Espressif's public framework packages (framework-arduinoespressif32-libs: mbedTLS constants and framework strings). scan_image.py treats a listed run as public; an unlisted one is refused. Regenerate with tools/trace_public_runs.py on a machine with PlatformIO when a new release is refused.",
+ "traced": "2026-09-24, scan_image.py --trace ~/.platformio/packages",
+ "images": [
+  {
+   "image": "Glasscalibur.factory.bin",
+   "sha256": "3be774d8fa75076bb05bc9156feb9a966c823f5f1d71b86678b4efb9cf4f2550"
+  },
+  {
+   "image": "Ropener-VAL3000.factory.bin",
+   "sha256": "88b7cb70f3503b8d8218c9b77f61cb73e3459ee19509aa68d2c8bd4ec522bc5f"
+  },
+  {
+   "image": "Ropener-VAL3100.factory.bin",
+   "sha256": "fd3289d7fec9c985121e97788efc8e3d79a3f6b7d710a0cf712e5a0dea16c745"
+  },
+  {
+   "image": "val3000.factory.bin",
+   "sha256": "83ea6e3210e44c76109773d19d92da5ea17af53cd45cb246fbeaa7d444344e07"
+  },
+  {
+   "image": "val3100.factory.bin",
+   "sha256": "78103bf319d8691bb8e1326e1fa54e7fd878d74dcadd6d50931ac4de73b5b4bd"
+  },
+  {
+   "image": "val3101.factory.bin",
+   "sha256": "b9b9e8f4947716b2e2291915e0d504b0fff9aaae140f41963bf59a5159c6b974"
+  }
+ ],
+ "public_runs": [
+  "06144e803a280c9642d166cfc6e3b05c1244de709a0a543a191c8fa90f0891f5",
+  "21f81e31ee70ba37d75c439f796b0386be03e9b3e15d9246b88520c1d0e459ef",
+  "370a52bb8ff2081b5b7690b5466e64c3bc7c7a1baf4e40978bb4015863effc28",
+  "4b7582b0c5e72cefef5593126701cc5e2f2154a2e083b98a288c84470020ebbe",
+  "5534c7ed3385fd8f3c9e6cb86b7ac7d4344dadaa6bde3aeb9352d37803d06de5",
+  "56ce87292ac5480d67ee9b563bf21034d62d7f0d386aed24fc89b37a89f9e3e9",
+  "639921f248229692caa5c797c1edbeb22ab42732cc095d7f8ffb5ef5040dd09f",
+  "82e943584d8460b39b4a3a13ff4a4ec4aa27ecdc33bfcb1c61b396f6bb931540",
+  "993e933b46ad1b97c0d93068c63f1635ab7ac1a3abe1b1b76cc19bc1d838bb1a",
+  "a6e63eb304afbaee0def77514d20673804bdb5c3a2bbf1d445f97aa11578bb6c",
+  "cf72782f6dd2e7fe244c3dabbcfcbb0ab7bb68e09dadd11999addfadf702316a",
+  "d21ac42df5d61aa5a0c2c2d999817e257c7679a30f3bdfe7185a09be5bc2dece",
+  "d7ed4d0d78103b44d4e2cf5384c465d7bc0058eb83044997b6023425831bf9b1",
+  "d9b2d5e21d1487835044a2904f0b9afd4aae51fb1a9c60ac80d609fc2518f016",
+  "dde5b3b7ae647fbbf14665cf820d479543409d7ac6b01714e5c966d45ccd6807",
+  "e64bfa277fee641c358b96966cb06ea5565395ee5fbeecb3b0226bdc003f601d",
+  "e988b563024e3d00f0ee937627353cbc8533bf222978b36b5173dc82061ebfa5",
+  "f5a30b34f3e6da701cdaef9847b0ed4bf7c743648f0555c1f778bb0bd6941f5e",
+  "f9907592c39745488ca2e082248996e4e84ffc3d3197bcfa6e64a7e75608cea7"
+ ]
+}

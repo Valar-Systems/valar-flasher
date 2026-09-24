@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The scanner's own rules must be able to fire before its verdicts are used.
+      - name: scan_image.py selftest
+        run: python scan_image.py --selftest
+      # No board, no network: esptool and the provisioner are fakes. Includes the
+      # byte-identical regression for Ropener / Glasscalibur / Generic board, the
+      # "flash mode never writes inside NVS" assertion and its control, and the
+      # red tile on a provisioner that exits non-zero.
+      - name: Flasher tests
+        run: python -m unittest discover -s tests -v
+      - name: The drift check must be able to refuse
+        run: python tools/check_vendored_scan.py --selftest
+      - name: scan_image.py is byte-for-byte Blipscope's
+        run: python tools/check_vendored_scan.py

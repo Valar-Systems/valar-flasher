@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to products.local.json (gitignored) on the ONE machine that provisions boards. It is merged over products.json. Nothing here is a secret: DEVICE_KEY_SECRET is read by the provisioner from the environment and is never written in any file.",
+  "products": {
+    "Blipscope": {
+      "provisioner": {
+        "command": "C:/path/to/Blipscope/scripts/provision_one.py",
+        "args": ["--env", "blipscope-s3-128", "--verify-url", "https://scopes.valarsystems.com"],
+        "log": "C:/path/to/Blipscope/provisioned.csv"
+      },
+      "variants": {
+        "Kit S3 1.28in (s3-128)": {
+          "_release_tag": "set to a prerelease tag to flash from it instead of releases/latest",
+          "_local_build": "set to a directory written by Blipscope's scripts/flash_manifest.py --out to flash a LOCAL BUILD (labelled; see README)"
+        }
+      }
+    }
+  }
+}

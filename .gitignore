@@ -9,3 +9,11 @@ github_token.txt
 # Auto-downloaded firmware cache (pulled from GitHub releases at runtime)
 firmware/**/*.bin
 firmware/**/.release_tag
+firmware/**/*.json
+
+# MACHINE-LOCAL settings: a provisioner's command path, a release-tag override,
+# a local build. Never shipped -- see products.local.example.json.
+products.local.json
+
+# The manufacturing record, when bench mode keeps it next to the script
+provisioned.csv
