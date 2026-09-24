@@ -1,0 +1,7 @@
+{
+ "repo": "Valar-Systems/valar-scopes",
+ "path": "scripts/scan_image.py",
+ "commit": "1f6ff8024d23b3d832eaded6659dee5f9cfb718b",
+ "sha256": "1a6cd5a25bc3229bd84dcdc6eaa8384fb9476266c87a9c4fa815a12d99576b81",
+ "why": "vendored byte-for-byte (LF, as git stores it); tests assert this sha256 over the LF-normalised file, and CI fetches the file at this commit and on valar-scopes main and fails if either differs"
+}

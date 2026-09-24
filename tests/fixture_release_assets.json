@@ -1,0 +1,35 @@
+[
+ {
+  "assets": [
+   "Ropener-VAL3000.factory.bin",
+   "Ropener-VAL3000.ota.bin",
+   "Ropener-VAL3000.ota.bin.md5",
+   "Ropener-VAL3100.factory.bin",
+   "Ropener-VAL3100.ota.bin",
+   "Ropener-VAL3100.ota.bin.md5"
+  ],
+  "repo": "Valar-Systems/Ropener",
+  "tag": "v2.9.0"
+ },
+ {
+  "assets": [
+   "Glasscalibur.factory.bin",
+   "Glasscalibur.ota.bin",
+   "Glasscalibur.ota.bin.md5"
+  ],
+  "repo": "Valar-Systems/Glasscalibur",
+  "tag": "v2.1.0"
+ },
+ {
+  "assets": [
+   "val3000.factory.bin",
+   "val3000.ota.bin",
+   "val3100.factory.bin",
+   "val3100.ota.bin",
+   "val3101.factory.bin",
+   "val3101.ota.bin"
+  ],
+  "repo": "Valar-Systems/valar-motion",
+  "tag": "v0.3.0"
+ }
+]

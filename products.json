@@ -20,6 +20,20 @@
         "esp32c3": "val3000",
         "esp32c6": "val3100"
       }
+    },
+    "Blipscope": {
+      "select": "variant",
+      "default_variant": "Kit S3 1.28in (s3-128)",
+      "variants": {
+        "Kit S3 1.28in (s3-128)": {
+          "chip": "esp32s3",
+          "repo": "Valar-Systems/valar-scopes",
+          "asset": "firmware-s3-128.factory.bin",
+          "manifest": "flash-manifest-s3-128.json",
+          "anchor": "[build] env="
+        }
+      },
+      "provisioner": { "env": "DEVICE_KEY_SECRET" }
     }
   }
 }
