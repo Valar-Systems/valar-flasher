@@ -13,11 +13,16 @@ import sys
 
 port, mac, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
 log = rest[rest.index("--log") + 1] if "--log" in rest else None
+# The real provisioner needs the token FILE's path from the flasher; refuse without it,
+# so every DONE in the flasher's tests also proves the flasher passed it.
+if "--token-file" not in rest or not os.path.exists(rest[rest.index("--token-file") + 1]):
+    print("RESULT FAIL no --token-file passed (or the file is missing)")
+    sys.exit(3)
 print("STEP write", flush=True)
 print("STEP verify", flush=True)
 code = int(os.environ.get("FAKE_PROV_EXIT", "0"))
 if code != 0:
-    print("RESULT FAIL key REJECTED (401) -- DEVICE_KEY_SECRET does not match the Worker's")
+    print("RESULT FAIL 02:00:00:00:00:01: PROVISION_TOKEN rejected (403) -- the token file does not match the Worker's")
     sys.exit(code)
 if os.environ.get("FAKE_PROV_LIE") == "1":
     sys.exit(0)

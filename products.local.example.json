@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to products.local.json (gitignored) on the ONE machine that provisions boards. It is merged over products.json. Nothing here is a secret: DEVICE_KEY_SECRET is read by the provisioner from the environment and is never written in any file.",
+  "_comment": "Copy to products.local.json (gitignored) on the ONE machine that provisions boards. It is merged over products.json. Nothing here is a secret. Keys are minted by the Worker; the bench's provisioning token lives in ~/.config/valar-flasher/provision-token (never in this file), and nobody holds DEVICE_KEY_SECRET.",
   "products": {
     "Blipscope": {
       "provisioner": {
