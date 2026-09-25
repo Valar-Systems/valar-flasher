@@ -143,6 +143,22 @@ failure is listed again at the end. Console form:
 python valar_flasher.py --product Blipscope --bench --count 50
 ```
 
+**Other boards attached?** Every Valar board shows up with the same Espressif USB
+ID, so three guards stand between bench mode and the wrong board:
+
+- **Protected boards.** List them in `~/.config/valar-flasher/protected-macs.json`
+  (never in this repo — it names your bench's hardware):
+  `{"macs": {"90:70:69:32:6e:64": "COM6 -- configured bench unit"}}`.
+  A protected board is refused on any port, in any mode: first by the USB serial
+  number the OS already holds, so it is not even reset, then again by the MAC
+  esptool reads, before any write. Its tile goes red. A list that exists but
+  cannot be read refuses bench mode outright.
+- **No `--ports`: confirm the list.** Bench mode prints every board it sees —
+  port, MAC, and which are EXCLUDED as protected — and flashes nothing until you
+  type `yes`. It then flashes only those MACs; a board plugged in afterwards is
+  refused, not flashed unlisted. Re-run to add it.
+- **`--ports COM18`** (comma-separate several): only those ports are ever seen.
+
 ## Under the hood
 
 Standard `esptool`. Chip-select products: `write_flash 0x0 <factory.bin>` — the

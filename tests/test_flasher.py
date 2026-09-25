@@ -61,7 +61,12 @@ def make_variant(d, slug="s3-128", app_extra=b""):
 class Rig(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
-        self.saved = (vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE)
+        self.saved = (vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE, vf.PROTECTED_FILE,
+                      vf._port_serials, vf.PORT_ALLOW)
+        # Never this machine's real protected list or real ports.
+        vf.PROTECTED_FILE = os.path.join(self.td, "protected-macs.json")
+        vf._port_serials = lambda: {}
+        vf.PORT_ALLOW = None
         vf.FW_ROOT = os.path.join(self.td, "firmware")
         vf.ESPTOOL = [sys.executable, os.path.join(HERE, "fake_esptool.py")]
         vf.KNOWN_PUBLIC_FILE = os.path.join(ROOT, "known_public_runs.json")
@@ -76,7 +81,8 @@ class Rig(unittest.TestCase):
         self.msgs = []
 
     def tearDown(self):
-        vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE = self.saved
+        (vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE, vf.PROTECTED_FILE,
+         vf._port_serials, vf.PORT_ALLOW) = self.saved
         shutil.rmtree(self.td, ignore_errors=True)
 
     def calls(self):
@@ -99,7 +105,9 @@ class LegacyProductsUnchanged(unittest.TestCase):
 
     def test_flash_plans_are_byte_identical_to_40595f3(self):
         now = serialize(resolve_plans(vf, os.path.join(ROOT, "products.json")))
-        golden = open(os.path.join(HERE, "golden_legacy_plans.json"), "rb").read()
+        with open(os.path.join(HERE, "golden_legacy_plans.json"), "rb") as f:
+            # LF-normalised: git stores LF, and a Windows checkout hands us CRLF.
+            golden = f.read().replace(b"\r\n", b"\n")
         self.assertEqual(now, golden)
 
     def test_their_products_json_entries_are_unchanged(self):
@@ -259,6 +267,162 @@ class Bench(Rig):
         vf.bench_loop(s, threading.Event(), ports_fn=lambda: next(ports), poll=0.01)
         self.assertEqual(s.done, 1)
         self.assertEqual(s.progress(), "1 of 1 this session")
+
+
+class PortAllowlist(Rig):
+    """--ports: a bench run on a machine with other boards attached touches only
+    the named port. Every Valar board is 303A, so VID cannot tell them apart."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved_ports = (vf._enumerate_ports, vf.PORT_ALLOW)
+        vf._enumerate_ports = lambda: [("COM6", 0x303A), ("COM15", 0x303A), ("COM18", 0x303A)]
+
+    def tearDown(self):
+        vf._enumerate_ports, vf.PORT_ALLOW = self.saved_ports
+        super().tearDown()
+
+    def test_control_without_ports_every_esp_board_is_seen(self):
+        vf.PORT_ALLOW = None
+        self.assertEqual(vf.list_ports(), ["COM6", "COM15", "COM18"])
+
+    def test_with_ports_only_the_named_board_is_seen(self):
+        vf.PORT_ALLOW = {"COM18"}
+        self.assertEqual(vf.list_ports(), ["COM18"])
+
+    def test_a_bench_run_touches_only_the_named_port(self):
+        vf.PORT_ALLOW = {"COM18"}
+        csv_path = os.path.join(self.td, "provisioned.csv")
+        pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
+                "provisioner": {"env": "DEVICE_KEY_SECRET",
+                                "command": os.path.join(HERE, "fake_provisioner.py"), "log": csv_path}}
+        s = vf.BenchSession("Blipscope", VNAME, self.vcfg, pcfg, count=1)
+        vf.bench_loop(s, threading.Event(), ports_fn=vf.list_ports, poll=0.01)
+        self.assertEqual(s.done, 1)
+        self.assertEqual(sorted({c["port"] for c in self.calls()}), ["COM18"])
+
+
+COM6_MAC, COM15_SERIAL, COM18_MAC = "90:70:69:32:6e:64", "90706931E9D8", "90:70:69:31:e2:08"
+
+
+class Protected(Rig):
+    """A protected board is refused before any write -- and, when the OS already
+    knows its MAC, before esptool even resets it."""
+
+    def setUp(self):
+        super().setUp()
+        with open(vf.PROTECTED_FILE, "w") as f:
+            json.dump({"macs": {COM6_MAC: "COM6 bench unit", "90:70:69:31:e9:d8": "COM15 Missileer"}}, f)
+        self.pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
+                     "provisioner": {"env": "DEVICE_KEY_SECRET",
+                                     "command": os.path.join(HERE, "fake_provisioner.py"),
+                                     "log": os.path.join(self.td, "provisioned.csv")}}
+        os.environ["DEVICE_KEY_SECRET"] = "test-only"
+
+    def tearDown(self):
+        os.environ.pop("DEVICE_KEY_SECRET", None)
+        super().tearDown()
+
+    def run_board(self, port):
+        s = vf.BenchSession("Blipscope", VNAME, self.vcfg, self.pcfg)
+        return vf.bench_board(port, s), s
+
+    def test_protected_by_usb_serial_is_red_and_untouched(self):
+        vf._port_serials = lambda: {"COM6": "90:70:69:32:6E:64"}
+        result, s = self.run_board("COM6")
+        self.assertEqual(result, "FAILED")
+        t = s.tiles["COM6"]
+        self.assertEqual(vf.TILE_COLOR[t["state"]], "#e5534b")
+        self.assertIn("PROTECTED", t["detail"])
+        self.assertEqual(self.calls(), [], "a protected board must not even be reset")
+
+    def test_tinyusb_serial_form_matches(self):
+        vf._port_serials = lambda: {"COM15": COM15_SERIAL}
+        result, s = self.run_board("COM15")
+        self.assertEqual(result, "FAILED")
+        self.assertEqual(self.calls(), [])
+
+    def test_protected_seen_only_by_esptool_is_red_before_any_write(self):
+        os.environ["FAKE_MAC"] = COM6_MAC          # the OS reports no serial for it
+        result, s = self.run_board("COMX")
+        self.assertEqual(result, "FAILED")
+        self.assertIn("PROTECTED", s.tiles[COM6_MAC]["detail"])
+        self.assertEqual([c["sub"] for c in self.calls()], ["read_mac"], "nothing past the MAC read")
+
+    def test_control_an_unprotected_board_is_done(self):
+        vf._port_serials = lambda: {"COM18": "90:70:69:31:E2:08"}
+        os.environ["FAKE_MAC"] = COM18_MAC
+        result, s = self.run_board("COM18")
+        self.assertEqual(result, "DONE")
+
+    def test_flash_mode_refuses_a_protected_board_untouched(self):
+        vf._port_serials = lambda: {"COM6": COM6_MAC}
+        ok, msg = vf.flash_variant("COM6", "Blipscope", VNAME, self.vcfg, False, self.msgs.append)
+        self.assertFalse(ok)
+        self.assertIn("PROTECTED", msg)
+        self.assertEqual(self.calls(), [])
+
+    def test_an_unreadable_list_refuses_bench_mode(self):
+        with open(vf.PROTECTED_FILE, "w") as f:
+            f.write("{ not json")
+        self.assertIn("protected-board list", vf.bench_refusal(self.pcfg))
+
+
+class Confirmation(Protected):
+    """No --ports: bench mode lists every board it will flash and needs 'yes'."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved_c = (vf._enumerate_ports, vf.sync_variant)
+        vf._enumerate_ports = lambda: [("COM6", 0x303A), ("COM15", 0x303A), ("COM18", 0x303A)]
+        vf._port_serials = lambda: {"COM6": COM6_MAC, "COM15": COM15_SERIAL, "COM18": COM18_MAC}
+        vf.sync_variant = lambda *a, **k: None
+        os.environ["FAKE_MAC"] = COM18_MAC
+        self.cfg = {"products": {"Blipscope": self.pcfg}}
+
+    def tearDown(self):
+        vf._enumerate_ports, vf.sync_variant = self.saved_c
+        super().tearDown()
+
+    def console(self, answer, count=1):
+        import builtins
+        import contextlib
+        import io
+        saved = builtins.input
+        builtins.input = lambda prompt="": answer
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = vf.run_console(self.cfg, "Blipscope", VNAME, bench=True, count=count)
+        finally:
+            builtins.input = saved
+        return rc, out.getvalue()
+
+    def test_the_list_names_every_board_and_excludes_the_protected(self):
+        targets, lines = vf.bench_targets()
+        self.assertEqual(targets, {"COM18": COM18_MAC})
+        self.assertEqual(sum("PROTECTED" in l for l in lines), 2)
+        self.assertEqual(sum("WILL BE FLASHED" in l for l in lines), 1)
+
+    def test_anything_but_yes_flashes_nothing(self):
+        rc, out = self.console("y")
+        self.assertEqual(rc, 2)
+        self.assertIn("Nothing done", out)
+        self.assertEqual(self.calls(), [])
+
+    def test_yes_flashes_only_the_listed_board(self):
+        rc, out = self.console("yes")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted({c["port"] for c in self.calls()}), ["COM18"])
+        self.assertNotIn("FAILED", out)
+
+    def test_a_board_attached_after_confirmation_is_refused_untouched(self):
+        s = vf.BenchSession("Blipscope", VNAME, self.vcfg, self.pcfg)
+        s.allowed_macs = {COM18_MAC}
+        vf._port_serials = lambda: {"COM20": "90:70:69:00:00:99"}
+        self.assertEqual(vf.bench_board("COM20", s), "FAILED")
+        self.assertIn("not in the list confirmed", s.tiles["COM20"]["detail"])
+        self.assertEqual(self.calls(), [])
 
 
 class Vendored(unittest.TestCase):

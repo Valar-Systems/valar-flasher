@@ -396,19 +396,95 @@ def scan_gate(image_path, anchor, list_paths):
 
 
 # ---- serial + esptool ------------------------------------------------------
-def list_ports():
+# --ports: when set, the ONLY ports this run may see, and therefore touch. Every
+# Valar board presents the same Espressif USB ID, so on a machine with a board
+# that must not be flashed (a configured unit, another project's device) the
+# default "every ESP port" is exactly the wrong set. Applied inside list_ports,
+# the one function every flash and bench path gets its ports from.
+PORT_ALLOW = None
+
+
+def _enumerate_ports():
+    """[(device, vid)] for every serial port; [] if pyserial is missing."""
     try:
         from serial.tools import list_ports as lp
     except Exception:
         return []
+    return [(p.device, getattr(p, "vid", None)) for p in lp.comports()]
+
+
+def list_ports():
+    ports = _enumerate_ports()
+    if PORT_ALLOW is not None:
+        return [d for d, _ in ports if d and d.upper() in PORT_ALLOW]
     esp, other = [], []
-    for p in lp.comports():
-        vid = getattr(p, "vid", None)
+    for device, vid in ports:
         if vid in (0x303A, 0x10C4, 0x1A86, 0x0403):
-            esp.append(p.device)
-        elif p.device:
-            other.append(p.device)
+            esp.append(device)
+        elif device:
+            other.append(device)
     return esp if esp else other
+
+
+# ---- protected boards --------------------------------------------------------
+# Boards on THIS machine that must never be written: a configured unit, another
+# product's test board, another project's device. Kept in a local file, never in
+# the repo (it names this bench's hardware), at ~/.config/valar-flasher/
+# protected-macs.json or $VALAR_FLASHER_PROTECTED:
+#     {"macs": {"90:70:69:32:6e:64": "COM6 -- bench unit", ...}}
+# Checked FIRST by the USB serial number the OS already holds (an S3's native USB
+# reports its MAC there), so a protected board is refused without even being
+# reset; then again by the MAC esptool reads, before any write.
+PROTECTED_FILE = os.environ.get("VALAR_FLASHER_PROTECTED") or os.path.join(
+    os.path.expanduser("~"), ".config", "valar-flasher", "protected-macs.json")
+
+
+def norm_mac(s):
+    """'90:70:69:31:E2:08' / '90706931E208' / '90-70-..' -> '90:70:69:31:e2:08'; else None."""
+    h = re.sub(r"[^0-9a-fA-F]", "", s or "").lower()
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2)) if len(h) == 12 else None
+
+
+class ProtectedListError(Exception):
+    pass
+
+
+def load_protected():
+    """{mac: label}. No file = nothing protected. A file that exists but cannot be
+    read is an ERROR, not an empty list -- a guard that fails open is not a guard."""
+    if not os.path.exists(PROTECTED_FILE):
+        return {}
+    try:
+        with open(PROTECTED_FILE, encoding="utf-8") as f:
+            macs = json.load(f).get("macs", {})
+        out = {norm_mac(k): v for k, v in macs.items()}
+        if None in out:
+            raise ValueError("an entry is not a MAC address")
+        return out
+    except (OSError, ValueError, AttributeError) as e:
+        raise ProtectedListError(f"{PROTECTED_FILE} cannot be read ({e})")
+
+
+def _port_serials():
+    """{device: USB serial number} from the OS -- no port is opened."""
+    try:
+        from serial.tools import list_ports as lp
+    except Exception:
+        return {}
+    return {p.device: getattr(p, "serial_number", None) for p in lp.comports()}
+
+
+def usb_mac(port):
+    return norm_mac(_port_serials().get(port))
+
+
+def protected_reason(port, mac=None):
+    """One line if the board on `port` (or with `mac`) is protected, else None."""
+    prot = load_protected()
+    for m in (usb_mac(port), norm_mac(mac) if mac else None):
+        if m and m in prot:
+            return f"PROTECTED board {m} ({prot[m]}) -- refused, nothing written"
+    return None
 
 
 def run_esptool(args, timeout=180):
@@ -462,6 +538,12 @@ def flash_pairs(port, chip, pairs):
 
 def flash_variant(port, product, vname, vcfg, factory_reset, log):
     """Flash one board with a variant's image. (ok, message)."""
+    try:
+        prot = protected_reason(port)
+    except ProtectedListError as e:
+        return False, f"REFUSED -- {e}"
+    if prot:
+        return False, prot
     vdir, local = variant_source(product, vname, vcfg)
     if local:
         log(f"[{port}] {LOCAL_BUILD_WARNING}")
@@ -503,6 +585,12 @@ def bench_refusal(pcfg):
     if not os.environ.get(env):
         return (f"Bench mode needs {env} set in the environment this program was started from; "
                 f"it is never typed or stored here.")
+    if prov["command"].endswith(".py") and not os.path.exists(prov["command"]):
+        return f"The provisioner configured in products.local.json does not exist: {prov['command']}"
+    try:
+        load_protected()
+    except ProtectedListError as e:
+        return f"Bench mode refused: the protected-board list {e}."
     return None
 
 
@@ -531,6 +619,10 @@ class BenchSession:
         self.done = 0
         self.failures = []
         self.on_change = on_change or (lambda: None)
+        # When bench mode ran without --ports, the operator confirmed exactly these
+        # MACs; any other board that appears is refused rather than flashed unlisted.
+        self.allowed_macs = None
+        self.excluded_ports = set()   # listed as EXCLUDED at confirmation; never dispatched
         prov = pcfg.get("provisioner") or {}
         self.log_path = prov.get("log") or os.path.join(HERE, "provisioned.csv")
 
@@ -569,9 +661,33 @@ def bench_board(port, s):
     """The whole bench pipeline for one attached board. DONE means verified:
     reached only on the provisioner's exit 0 with a RESULT OK line."""
     s.set(port, "waiting", "reading MAC", port=port)
+
+    def refuse(mac_seen):
+        try:
+            prot = protected_reason(port, mac_seen)
+        except ProtectedListError as e:
+            return f"REFUSED -- {e}"
+        if prot:
+            return prot
+        m = norm_mac(mac_seen) if mac_seen else usb_mac(port)
+        if s.allowed_macs is not None and m not in s.allowed_macs:
+            return f"board {m or 'with unknown MAC'} was not in the list confirmed at start -- re-run to include it"
+        return None
+
+    # BEFORE any contact: esptool resets the board just to read its MAC.
+    why = refuse(None)
+    if why:
+        s.set(port, "FAILED", why, port=port)
+        return "FAILED"
     mac, raw = read_mac(port)
     if not mac:
         s.set(port, "FAILED", "could not read the MAC (bad cable, or hold BOOT + tap RESET)", port=port)
+        return "FAILED"
+    # AGAIN on the MAC esptool read, before any write.
+    why = refuse(mac)
+    if why:
+        s.rekey(port, mac)
+        s.set(mac, "FAILED", why, mac=mac)
         return "FAILED"
     key = mac
     s.rekey(port, mac)
@@ -646,7 +762,7 @@ def bench_loop(s, stop, ports_fn=list_ports, poll=1.0):
         while not stop.is_set() and not s.reached():
             present = set(ports_fn())
             busy &= present | set(futures.values())
-            for port in sorted(present - busy):
+            for port in sorted(present - busy - s.excluded_ports):
                 if s.reached():
                     break
                 busy.add(port)
@@ -815,6 +931,14 @@ def run_gui(cfg):
                 state["handled"][port] = "err"
             state["busy"] = False
             return
+        try:
+            prot = protected_reason(port)
+        except ProtectedListError as e:
+            prot = f"REFUSED -- {e}"
+        if prot:
+            set_status("✗ PROTECTED board — refused", "#e5534b")
+            log(f"[{port}] {prot}")
+            state["busy"] = False; state["handled"][port] = "err"; return
         set_status(f"Detecting {os.path.basename(port)}…", "#e8c15a")
         chip, raw = detect_chip(port)
         if not chip:
@@ -923,6 +1047,18 @@ def run_gui(cfg):
                 n = 0
             s = BenchSession(state["product"], state["variant"], vcfg(), pcfg(), count=n,
                              on_change=lambda: q.put(("tiles", None)))
+            if PORT_ALLOW is None:
+                from tkinter import messagebox
+                targets, lines = bench_targets()
+                if not targets or not messagebox.askyesno(
+                        "Bench mode — confirm boards",
+                        "\n".join(lines) + f"\n\nFlash AND provision these {len(targets)} board(s)? "
+                        "Everything on them is erased. Boards attached later are NOT included."):
+                    bench_var.set(False)
+                    log("Bench mode not confirmed. Nothing done.")
+                    return
+                s.allowed_macs = set(targets.values())
+                s.excluded_ports = set(list_ports()) - set(targets)
             stop = threading.Event()
             state["bench"], state["bench_stop"] = s, stop
             tiles_frame.pack(fill="x", padx=12, before=logbox)
@@ -1002,6 +1138,23 @@ def run_gui(cfg):
 # ===========================================================================
 # Console fallback
 # ===========================================================================
+def bench_targets():
+    """({port: mac} bench mode would flash, [lines to show]). Reads USB serial
+    numbers only -- no board is opened or reset to build this list."""
+    prot = load_protected()
+    targets, lines = {}, ["Bench mode sees these boards:"]
+    for port in list_ports():
+        m = usb_mac(port)
+        if not m:
+            lines.append(f"  {port:8} MAC unknown        -- EXCLUDED (cannot identify it without touching it)")
+        elif m in prot:
+            lines.append(f"  {port:8} {m}  -- EXCLUDED: PROTECTED ({prot[m]})")
+        else:
+            targets[port] = m
+            lines.append(f"  {port:8} {m}  -- WILL BE FLASHED AND PROVISIONED")
+    return targets, lines
+
+
 def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_reset=False):
     products = cfg["products"]
     product = product or cfg.get("default") or next(iter(products))
@@ -1020,6 +1173,20 @@ def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_r
                 print(why)
                 return 2
             s = BenchSession(product, variant, vcfg, pcfg, count=count)
+            if PORT_ALLOW is None:
+                targets, lines = bench_targets()
+                print("\n".join(lines))
+                if not targets:
+                    print("No board to flash. Nothing done.")
+                    return 2
+                ans = input(f"\nFlash AND provision these {len(targets)} board(s)? Everything on them is erased. "
+                            f"Type yes to continue: ").strip().lower()
+                if ans != "yes":
+                    print("Not confirmed. Nothing done.")
+                    return 2
+                s.allowed_macs = set(targets.values())
+                s.excluded_ports = set(list_ports()) - set(targets)
+                print("Boards attached after this point are NOT included -- re-run to add them.\n")
             last = {}
 
             def show():
@@ -1071,6 +1238,12 @@ def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_r
             for p in present:
                 if p in handled:
                     continue
+                try:
+                    prot = protected_reason(p)
+                except ProtectedListError as e:
+                    prot = f"REFUSED -- {e}"
+                if prot:
+                    print(f"[{p}] {prot}"); handled[p] = 1; continue
                 chip, raw = detect_chip(p)
                 if not chip:
                     print(f"[{p}] chip not recognized"); handled[p] = 1; continue
@@ -1102,7 +1275,11 @@ if __name__ == "__main__":
     ap.add_argument("--bench", action="store_true", help="bench mode (console)")
     ap.add_argument("--count", type=int, default=0, help="bench: stop after this many new boards")
     ap.add_argument("--factory-reset", action="store_true", help="erase settings (console flash mode)")
+    ap.add_argument("--ports", help="comma-separated: the ONLY ports this run may touch, e.g. COM18")
     a = ap.parse_args()
+    if a.ports:
+        PORT_ALLOW = {p.strip().upper() for p in a.ports.split(",") if p.strip()}
+        print(f"[valar-flasher] only these ports will be touched: {', '.join(sorted(PORT_ALLOW))}")
     cfg = load_products()
     if a.console or a.bench or a.product or a.variant:
         sys.exit(run_console(cfg, a.product, a.variant, a.bench, a.count, a.factory_reset))
