@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -96,11 +97,18 @@ class Rig(unittest.TestCase):
                      "manifest": "flash-manifest-s3-128.json", "anchor": "[build] env="}
         self.vdir = vf.variant_dir("Blipscope", VNAME)
         self.manifest = make_variant(self.vdir)
+        # The cache stands in for one synced from a TAGGED release; the release
+        # checks refuse a set with no record, so the fixture must carry one.
+        with open(os.path.join(self.vdir, vf.RELEASE_RECORD), "w") as f:
+            json.dump({"tag": "v99", "prerelease": False}, f)
+        self.saved_allow = vf.ALLOW_PRERELEASE
+        vf.ALLOW_PRERELEASE = False
         self.msgs = []
 
     def tearDown(self):
         (vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE, vf.PROTECTED_FILE,
          vf._port_serials, vf.PORT_ALLOW, vf.PROVISION_TOKEN_FILE) = self.saved
+        vf.ALLOW_PRERELEASE = self.saved_allow
         vf.bench_loop = self._orig_loop
         shutil.rmtree(self.td, ignore_errors=True)
 
@@ -191,6 +199,8 @@ class FlashMode(Rig):
         a key -- what a local build with -DCLOUD_FEED_KEY looks like."""
         shutil.rmtree(self.vdir)
         make_variant(self.vdir, app_extra=b"\0" + secrets.token_hex(32).encode())
+        with open(os.path.join(self.vdir, vf.RELEASE_RECORD), "w") as f:   # a tagged release,
+            json.dump({"tag": "v99", "prerelease": False}, f)                # so the SCAN refuses
         ok, msg = self.flash()
         self.assertFalse(ok)
         self.assertIn("REFUSED", msg)
@@ -451,6 +461,113 @@ class Confirmation(Protected):
         self.assertEqual(vf.bench_board("COM20", s), "FAILED")
         self.assertIn("not in the list confirmed", s.tiles["COM20"]["detail"])
         self.assertEqual(self.calls(), [])
+
+
+class ReleaseChecks(Rig):
+    """Manifest resolution: the app region must BE the release's firmware-<slug>.bin,
+    a prerelease is refused without --allow-prerelease, and bench mode writes only
+    a tagged release -- checked at download AND at use."""
+
+    def setUp(self):
+        super().setUp()
+        self.csv = os.path.join(self.td, "provisioned.csv")
+        self.pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
+                     "provisioner": {"command": os.path.join(HERE, "fake_provisioner.py"),
+                                     "log": self.csv}}
+        self.saved_get_release = vf.get_release
+        self.rel = os.path.join(self.td, "release")   # the release's assets, served as file://
+        make_variant(self.rel)
+        self.prerelease = False
+
+        def fake_get_release(repo, tag, log):
+            assets = [{"name": n, "browser_download_url": Path(os.path.join(self.rel, n)).as_uri()}
+                      for n in os.listdir(self.rel)]
+            return "v99", assets, self.prerelease
+        vf.get_release = fake_get_release
+        shutil.rmtree(self.vdir)          # nothing cached: every test starts from a sync
+
+    def tearDown(self):
+        vf.get_release = self.saved_get_release
+        super().tearDown()
+
+    def session(self, count=0):
+        return vf.BenchSession("Blipscope", VNAME, self.vcfg, self.pcfg, count=count)
+
+    def sync(self):
+        return vf.sync_variant("Blipscope", VNAME, self.vcfg, self.msgs.append, force=True)
+
+    def rename_app(self, new):
+        """Make the release's manifest name a different, self-consistent app file."""
+        mp = os.path.join(self.rel, "flash-manifest-s3-128.json")
+        m = json.load(open(mp))
+        app = next(r for r in m["regions"] if r["name"] == "app")
+        shutil.copy(os.path.join(self.rel, app["file"]), os.path.join(self.rel, new))
+        app["file"] = new
+        json.dump(m, open(mp, "w"))
+
+    def test_CONTROL_a_tagged_release_syncs_and_the_bench_writes_it(self):
+        self.assertEqual(self.sync(), "v99", self.msgs)
+        rec = vf.read_release_record(self.vdir)
+        self.assertEqual((rec["tag"], rec["prerelease"]), ("v99", False))
+        self.assertEqual(vf.bench_board("COMX", self.session()), "DONE")
+
+    def test_app_region_not_named_firmware_slug_is_refused(self):
+        self.rename_app("app-s3-128.bin")
+        # the release's OTA binary is now something else; the manifest set stays self-consistent
+        with open(os.path.join(self.rel, "firmware-s3-128.bin"), "ab") as f:
+            f.write(b"a different build")
+        self.assertIsNone(self.sync())
+        self.assertFalse(os.path.isdir(self.vdir), "nothing may be cached")
+        self.assertTrue(any("app region is not firmware-s3-128.bin" in m for m in self.msgs), self.msgs)
+
+    def test_app_hash_differing_from_the_releases_firmware_bin_is_refused(self):
+        with open(os.path.join(self.rel, "firmware-s3-128.bin"), "ab") as f:
+            f.write(b"a different build")
+        self.assertIsNone(self.sync())
+        self.assertFalse(os.path.isdir(self.vdir))
+
+    def test_a_prerelease_is_refused_without_the_flag(self):
+        self.prerelease = True
+        self.assertIsNone(self.sync())
+        self.assertFalse(os.path.isdir(self.vdir))
+        self.assertTrue(any("PRERELEASE" in m for m in self.msgs), self.msgs)
+
+    def test_a_prerelease_is_accepted_with_the_flag_and_recorded_as_one(self):
+        self.prerelease = True
+        vf.ALLOW_PRERELEASE = True
+        self.assertEqual(self.sync(), "v99", self.msgs)
+        self.assertTrue(vf.read_release_record(self.vdir)["prerelease"])
+
+    def _cache_prerelease(self):
+        self.prerelease = True
+        vf.ALLOW_PRERELEASE = True
+        self.assertEqual(self.sync(), "v99")
+        vf.ALLOW_PRERELEASE = False
+
+    def test_bench_refuses_a_cached_prerelease_without_the_flag(self):
+        self._cache_prerelease()
+        s = self.session()
+        self.assertEqual(vf.bench_board("COMX", s), "FAILED")
+        self.assertIn("PRERELEASE", s.tiles["00:00:00:00:00:01"]["detail"])
+        self.assertEqual(self.writes(), [], "nothing may be written")
+        vf.ALLOW_PRERELEASE = True
+        self.assertEqual(vf.bench_board("COMY", self.session()), "DONE", "CONTROL: the flag lets it through")
+
+    def test_bench_refuses_a_cache_with_no_release_record(self):
+        make_variant(self.vdir)            # an image set synced before the release checks existed
+        s = self.session()
+        self.assertEqual(vf.bench_board("COMX", s), "FAILED")
+        self.assertIn("no release record", s.tiles["00:00:00:00:00:01"]["detail"])
+        self.assertEqual(self.writes(), [])
+
+    def test_bench_refuses_a_local_build_even_with_the_flag(self):
+        make_variant(os.path.join(self.td, "local"))
+        vf.ALLOW_PRERELEASE = True
+        self.vcfg = dict(self.vcfg, local_build=os.path.join(self.td, "local"))
+        s = vf.BenchSession("Blipscope", VNAME, self.vcfg, self.pcfg)
+        self.assertEqual(vf.bench_board("COMX", s), "FAILED")
+        self.assertIn("never a local build", s.tiles["00:00:00:00:00:01"]["detail"])
+        self.assertEqual(self.writes(), [])
 
 
 class Vendored(unittest.TestCase):

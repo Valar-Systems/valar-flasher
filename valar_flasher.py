@@ -218,19 +218,50 @@ def variant_dir(product, vname):
     return os.path.join(fw_dir(product), safe)
 
 
+# A prerelease is a release UNDER TEST, not a release: the scratch build that
+# COM18 was provisioned from (2026-09-25) was a prerelease carrying an unreleased
+# build labelled 14. Customer boards are written from a tagged release;
+# --allow-prerelease is the explicit, visible way round that, for the bench only.
+ALLOW_PRERELEASE = False
+RELEASE_RECORD = ".release.json"   # {tag, prerelease}, written beside a synced image set
+
+
 def get_release(repo, tag, log):
-    """releases/latest, or one named tag when products.local.json pins one (a
-    prerelease under test). Returns (tag, assets) or None."""
-    if not tag:
-        return get_latest(repo, log)
-    url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
+    """releases/latest, or one named tag when products.local.json pins one.
+    Returns (tag, assets, prerelease) or None. A response without the prerelease
+    field counts AS a prerelease: unknown is not tagged."""
+    url = (f"https://api.github.com/repos/{repo}/releases/tags/{tag}" if tag
+           else f"https://api.github.com/repos/{repo}/releases/latest")
     try:
         req = urllib.request.Request(url, headers=_gh_headers())
         data = json.load(urllib.request.urlopen(req, timeout=30))
-        return (data.get("tag_name") or ""), data.get("assets", [])
+        return (data.get("tag_name") or ""), data.get("assets", []), bool(data.get("prerelease", True))
     except Exception as e:
-        log(f"Couldn't read release {tag} of {repo}: {e}")
+        log(f"Couldn't read release {tag or 'latest'} of {repo}: {e}")
         return None
+
+
+def read_release_record(vdir):
+    try:
+        with open(os.path.join(vdir, RELEASE_RECORD), encoding="utf-8") as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) and rec.get("tag") else None
+    except (OSError, ValueError):
+        return None
+
+
+def release_refusal(vdir, local, bench):
+    """None if this image set may be written, else why not -- checked at USE time,
+    not only at download, so a cache synced from a prerelease (or before this check
+    existed) cannot reach a board by being already on disk."""
+    if local:
+        return ("bench mode writes a tagged release, never a local build" if bench else None)
+    rec = read_release_record(vdir)
+    if rec is None:
+        return "no release record for this image set (synced before release checks) -- Update firmware"
+    if rec.get("prerelease") and not ALLOW_PRERELEASE:
+        return f"{rec['tag']} is a PRERELEASE -- not written without --allow-prerelease"
+    return None
 
 
 def _sha256(path):
@@ -300,8 +331,13 @@ def sync_variant(product, vname, vcfg, log, force=False):
         log(f"Offline — using cached {vname} ({cached})." if ok else
             f"Offline and no usable cached {vname}. Connect once.")
         return cached
-    tag, assets = rel
-    if not force and cached == tag and os.path.isdir(vdir) and check_variant_dir(vdir, vcfg)[0]:
+    tag, assets, prerelease = rel
+    if prerelease and not ALLOW_PRERELEASE:
+        log(f"  {vcfg['repo']} {tag} is a PRERELEASE — refused (pass --allow-prerelease to use it). "
+            f"Keeping the cache ({cached or 'none'}).")
+        return cached
+    if (not force and cached == tag and os.path.isdir(vdir) and read_release_record(vdir)
+            and check_variant_dir(vdir, vcfg)[0]):
         log(f"{vname} up to date ({tag}).")
         return tag
     by_name = {a.get("name"): a for a in assets}
@@ -329,8 +365,22 @@ def sync_variant(product, vname, vcfg, log, force=False):
         with open(os.path.join(tmp, m["scan"]["file"]), encoding="utf-8") as f:
             if json.load(f).get("image_sha256") != m["factory"]["sha256"]:
                 raise RuntimeError("the scan report is for a different image")
+        # THE APP REGION IS THIS RELEASE'S firmware-<slug>.bin -- the binary OTA ships.
+        # check_variant_dir already hashed every region file against the manifest,
+        # and every file came from THIS release; what it cannot establish is WHICH
+        # file the app region names. A self-consistent set naming "app-<slug>.bin"
+        # passes it while the release's OTA binary is something else entirely.
+        slug = m.get("slug")
+        ota = f"firmware-{slug}.bin"
+        if vcfg["manifest"] != f"flash-manifest-{slug}.json":
+            raise RuntimeError(f"the manifest is for slug {slug!r}, not {vcfg['manifest']}")
+        app = [r for r in m["regions"] if r.get("name") == "app"]
+        if len(app) != 1 or app[0].get("file") != ota:
+            raise RuntimeError(f"the manifest's app region is not {ota}, the binary {tag} ships to devices")
         with open(os.path.join(tmp, ".release_tag"), "w") as f:
             f.write(tag)
+        with open(os.path.join(tmp, RELEASE_RECORD), "w", encoding="utf-8") as f:
+            json.dump({"tag": tag, "prerelease": prerelease, "app_sha256": app[0]["sha256"]}, f)
         if os.path.isdir(vdir):
             shutil.rmtree(vdir)
         os.makedirs(os.path.dirname(vdir), exist_ok=True)
@@ -549,6 +599,9 @@ def flash_variant(port, product, vname, vcfg, factory_reset, log):
     vdir, local = variant_source(product, vname, vcfg)
     if local:
         log(f"[{port}] {LOCAL_BUILD_WARNING}")
+    refused = release_refusal(vdir, local, bench=False)
+    if refused:
+        return False, f"REFUSED — {refused}. Nothing was written."
     manifest, why = check_variant_dir(vdir, vcfg)
     if manifest is None:
         return False, f"{vname}: {why}"
@@ -720,6 +773,10 @@ def bench_board(port, s):
     try:
         s.set(key, "flashing", "", mac=mac)
         vdir, local = variant_source(s.product, s.vname, s.vcfg)
+        refused = release_refusal(vdir, local, bench=True)
+        if refused:
+            s.set(key, "FAILED", f"REFUSED — {refused}", mac=mac)
+            return "FAILED"
         manifest, why = check_variant_dir(vdir, s.vcfg)
         if manifest is None:
             s.set(key, "FAILED", why, mac=mac)
@@ -1291,7 +1348,12 @@ if __name__ == "__main__":
     ap.add_argument("--count", type=int, default=0, help="bench: stop after this many new boards")
     ap.add_argument("--factory-reset", action="store_true", help="erase settings (console flash mode)")
     ap.add_argument("--ports", help="comma-separated: the ONLY ports this run may touch, e.g. COM18")
+    ap.add_argument("--allow-prerelease", action="store_true",
+                    help="accept a PRERELEASE image set (a release under test); refused otherwise")
     a = ap.parse_args()
+    if a.allow_prerelease:
+        ALLOW_PRERELEASE = True
+        print("[valar-flasher] --allow-prerelease: a PRERELEASE image set will be accepted and written")
     if a.ports:
         PORT_ALLOW = {p.strip().upper() for p in a.ports.split(",") if p.strip()}
         print(f"[valar-flasher] only these ports will be touched: {', '.join(sorted(PORT_ALLOW))}")
