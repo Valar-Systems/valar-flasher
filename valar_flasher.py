@@ -13,7 +13,7 @@ OF TRUTH. A product selects its image one of two ways:
 
   "select": "variant" (Blipscope)
       {"variants": {"<name>": {"chip", "repo", "asset", "manifest", "anchor"}},
-       "provisioner": {"env": "DEVICE_KEY_SECRET"}}
+       "provisioner": {"auth": "provision-token"}}
       Every Blipscope SKU is the same ESP32-S3, so chip detection CANNOT tell them
       apart and a wrong pick flashes the wrong board's image. The operator picks
       the variant, and the chosen variant is shown in large type throughout.
@@ -31,9 +31,11 @@ CI never sets one, which is why the default image is the one CI published.
 
 Bench mode (provisioning) appears only for a product whose provisioner is
 configured in products.local.json (never in the shipped products.json), and it
-refuses unless the provisioner's env var (DEVICE_KEY_SECRET) is set in the
-environment this program was started from. The secret is never typed, stored or
-read here beyond "is it set"; the provisioner reads it itself.
+refuses unless the bench's provisioning token is in its file
+(~/.config/valar-flasher/provision-token). Keys are MINTED BY THE WORKER; nobody on
+the bench holds DEVICE_KEY_SECRET and nothing here reads it. The token is never
+typed into the window and never printed; the flasher checks only that the file
+exists, and hands its PATH (not its contents) to the provisioner.
 
 For each product it checks the repo's latest GitHub release on launch and caches
 the download (offline? it uses whatever is cached). Runs a small Tk window; falls
@@ -568,7 +570,19 @@ def flash_variant(port, product, vname, vcfg, factory_reset, log):
 
 
 # ---- bench mode (provisioning) ---------------------------------------------
-BENCH_ENV_DEFAULT = "DEVICE_KEY_SECRET"
+# The bench's PROVISION_TOKEN for the Worker's mint route (Blipscope
+# docs/provisioning-mint.md). One path, read by the flasher (presence only) and
+# passed to the provisioner with --token-file, so the two can never disagree.
+PROVISION_TOKEN_FILE = os.environ.get("VALAR_FLASHER_PROVISION_TOKEN") or os.path.join(
+    os.path.expanduser("~"), ".config", "valar-flasher", "provision-token")
+
+
+def provision_token_present():
+    try:
+        with open(PROVISION_TOKEN_FILE, encoding="utf-8") as f:
+            return bool(f.read().strip())
+    except OSError:
+        return False
 
 
 def bench_available(pcfg):
@@ -579,12 +593,11 @@ def bench_available(pcfg):
 def bench_refusal(pcfg):
     """None if bench mode may start, else the one sentence that says why not."""
     prov = pcfg.get("provisioner") or {}
-    env = prov.get("env", BENCH_ENV_DEFAULT)
     if not prov.get("command"):
         return "This product has no provisioner configured on this machine (products.local.json)."
-    if not os.environ.get(env):
-        return (f"Bench mode needs {env} set in the environment this program was started from; "
-                f"it is never typed or stored here.")
+    if not provision_token_present():
+        return (f"Bench mode needs the provisioning token in {PROVISION_TOKEN_FILE} -- "
+                f"put it there once from the password manager.")
     if prov["command"].endswith(".py") and not os.path.exists(prov["command"]):
         return f"The provisioner configured in products.local.json does not exist: {prov['command']}"
     try:
@@ -654,7 +667,9 @@ def provisioner_argv(pcfg, port, mac):
     prov = pcfg.get("provisioner") or {}
     cmd = prov["command"]
     head = [PY, cmd] if cmd.endswith(".py") else [cmd]
-    return head + [port, mac] + list(prov.get("args") or []) + (["--log", prov["log"]] if prov.get("log") else [])
+    return (head + [port, mac] + list(prov.get("args") or [])
+            + ["--token-file", PROVISION_TOKEN_FILE]
+            + (["--log", prov["log"]] if prov.get("log") else []))
 
 
 def bench_board(port, s):

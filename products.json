@@ -33,7 +33,7 @@
           "anchor": "[build] env="
         }
       },
-      "provisioner": { "env": "DEVICE_KEY_SECRET" }
+      "provisioner": { "auth": "provision-token" }
     }
   }
 }

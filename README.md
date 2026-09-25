@@ -128,9 +128,15 @@ warning everywhere it is used, and it is scanned like everything else.
 For the one machine that provisions new boards. Copy
 `products.local.example.json` to `products.local.json` (gitignored) and point
 `provisioner.command` at Blipscope's `scripts/provision_one.py`. **Bench mode**
-then appears; it refuses to start unless `DEVICE_KEY_SECRET` is set in the
-environment the flasher was started from — it is never typed into the window or
-stored in any file, and the flasher only checks that it is set.
+then appears.
+
+**Keys are minted by the Worker**, not derived on the bench: nobody holds
+`DEVICE_KEY_SECRET`, and nothing here asks for it. What the bench holds is a
+**provisioning token**. Put it once, from the password manager, in
+`~/.config/valar-flasher/provision-token`
+(`%USERPROFILE%\.config\valar-flasher\provision-token` on Windows). Bench mode
+refuses to start without it. The flasher only checks that the file exists and hands
+its path to the provisioner; the token is never shown in the window or printed.
 
 Load a powered hub. Each board gets a tile, keyed by its MAC:
 **waiting → flashing → provisioning → verifying → DONE**, or **FAILED (reason)**,
@@ -140,7 +146,7 @@ is in `provisioned.csv`. The header counts *N of --count this session*, and ever
 failure is listed again at the end. Console form:
 
 ```
-python valar_flasher.py --product Blipscope --bench --count 50
+python valar_flasher.py --product Blipscope --bench --count 50 --ports COM18
 ```
 
 **Other boards attached?** Every Valar board shows up with the same Espressif USB

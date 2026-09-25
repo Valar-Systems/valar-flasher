@@ -6,6 +6,7 @@ the provisioner is tests/fake_provisioner.py.
 """
 import hashlib
 import json
+import re
 import os
 import secrets
 import shutil
@@ -62,7 +63,24 @@ class Rig(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.mkdtemp()
         self.saved = (vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE, vf.PROTECTED_FILE,
-                      vf._port_serials, vf.PORT_ALLOW)
+                      vf._port_serials, vf.PORT_ALLOW, vf.PROVISION_TOKEN_FILE)
+        # A bench loop that never reaches its count must FAIL, not hang: in production it
+        # runs until Ctrl-C, so every test gets a deadline that stops it. (Found when a
+        # sabotage that made every board fail hung the suite instead of turning it red.)
+        self._orig_loop = vf.bench_loop
+
+        def _deadline_loop(s, stop, *a, **k):
+            t = threading.Timer(20, stop.set)
+            t.start()
+            try:
+                return self._orig_loop(s, stop, *a, **k)
+            finally:
+                t.cancel()
+        vf.bench_loop = _deadline_loop
+        # Never this machine's real token file: a test one, present by default.
+        vf.PROVISION_TOKEN_FILE = os.path.join(self.td, "provision-token")
+        with open(vf.PROVISION_TOKEN_FILE, "w") as f:
+            f.write("test-provision-token\n")
         # Never this machine's real protected list or real ports.
         vf.PROTECTED_FILE = os.path.join(self.td, "protected-macs.json")
         vf._port_serials = lambda: {}
@@ -82,7 +100,8 @@ class Rig(unittest.TestCase):
 
     def tearDown(self):
         (vf.FW_ROOT, vf.ESPTOOL, vf.KNOWN_PUBLIC_FILE, vf.PROTECTED_FILE,
-         vf._port_serials, vf.PORT_ALLOW) = self.saved
+         vf._port_serials, vf.PORT_ALLOW, vf.PROVISION_TOKEN_FILE) = self.saved
+        vf.bench_loop = self._orig_loop
         shutil.rmtree(self.td, ignore_errors=True)
 
     def calls(self):
@@ -206,14 +225,9 @@ class Bench(Rig):
         super().setUp()
         self.csv = os.path.join(self.td, "provisioned.csv")
         self.pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
-                     "provisioner": {"env": "DEVICE_KEY_SECRET",
+                     "provisioner": {
                                      "command": os.path.join(HERE, "fake_provisioner.py"),
                                      "log": self.csv}}
-        os.environ["DEVICE_KEY_SECRET"] = "test-only"
-
-    def tearDown(self):
-        os.environ.pop("DEVICE_KEY_SECRET", None)
-        super().tearDown()
 
     def session(self, count=0):
         return vf.BenchSession("Blipscope", VNAME, self.vcfg, self.pcfg, count=count)
@@ -233,7 +247,7 @@ class Bench(Rig):
         t = s.tiles["00:00:00:00:00:01"]
         self.assertEqual(t["state"], "FAILED")
         self.assertEqual(vf.TILE_COLOR[t["state"]], "#e5534b")
-        self.assertIn("REJECTED", t["detail"])
+        self.assertIn("PROVISION_TOKEN rejected (403)", t["detail"])
         self.assertEqual(s.done, 0)
         self.assertEqual(len(s.failures), 1)
 
@@ -249,15 +263,34 @@ class Bench(Rig):
         self.assertEqual(vf.bench_board("COMX", s), "SKIPPED")
         self.assertEqual(self.writes(), [])
 
-    def test_bench_refuses_in_one_sentence_without_the_env_var(self):
-        os.environ.pop("DEVICE_KEY_SECRET")
+    def test_bench_refuses_in_one_sentence_without_the_token_file(self):
+        self.assertIsNone(vf.bench_refusal(self.pcfg), "CONTROL: with the file, bench mode may start")
+        os.remove(vf.PROVISION_TOKEN_FILE)
         why = vf.bench_refusal(self.pcfg)
         self.assertIsNotNone(why)
         self.assertEqual(why.count(". "), 0, "one sentence")
-        self.assertIn("DEVICE_KEY_SECRET", why)
+        self.assertIn("provisioning token", why)
+        self.assertIn(vf.PROVISION_TOKEN_FILE, why)
+
+    def test_an_empty_token_file_is_no_token(self):
+        with open(vf.PROVISION_TOKEN_FILE, "w") as f:
+            f.write("   \n")
+        self.assertIsNotNone(vf.bench_refusal(self.pcfg))
+
+    def test_the_provisioner_gets_the_token_file_path_never_its_contents(self):
+        argv = vf.provisioner_argv(self.pcfg, "COMX", "00:00:00:00:00:01")
+        i = argv.index("--token-file")
+        self.assertEqual(argv[i + 1], vf.PROVISION_TOKEN_FILE)
+        self.assertNotIn("test-provision-token", " ".join(argv))
+
+    def test_the_flasher_never_reads_the_device_key_secret(self):
+        src = open(os.path.join(ROOT, "valar_flasher.py"), encoding="utf-8").read()
+        read = re.compile(r"(environ|getenv)[^\n]{0,40}DEVICE_KEY_SECRET")
+        self.assertIsNone(read.search(src))
+        self.assertIsNotNone(read.search('os.environ.get("DEVICE_KEY_SECRET")'), "CONTROL: the pattern finds a read")
 
     def test_bench_is_not_offered_without_a_local_command(self):
-        self.assertFalse(vf.bench_available({"provisioner": {"env": "DEVICE_KEY_SECRET"}}))
+        self.assertFalse(vf.bench_available({"provisioner": {"auth": "provision-token"}}))
         shipped = json.load(open(os.path.join(ROOT, "products.json")))["products"]["Blipscope"]
         self.assertNotIn("command", shipped.get("provisioner", {}), "the shipped products.json names no command")
 
@@ -294,7 +327,7 @@ class PortAllowlist(Rig):
         vf.PORT_ALLOW = {"COM18"}
         csv_path = os.path.join(self.td, "provisioned.csv")
         pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
-                "provisioner": {"env": "DEVICE_KEY_SECRET",
+                "provisioner": {
                                 "command": os.path.join(HERE, "fake_provisioner.py"), "log": csv_path}}
         s = vf.BenchSession("Blipscope", VNAME, self.vcfg, pcfg, count=1)
         vf.bench_loop(s, threading.Event(), ports_fn=vf.list_ports, poll=0.01)
@@ -314,14 +347,9 @@ class Protected(Rig):
         with open(vf.PROTECTED_FILE, "w") as f:
             json.dump({"macs": {COM6_MAC: "COM6 bench unit", "90:70:69:31:e9:d8": "COM15 Missileer"}}, f)
         self.pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
-                     "provisioner": {"env": "DEVICE_KEY_SECRET",
+                     "provisioner": {
                                      "command": os.path.join(HERE, "fake_provisioner.py"),
                                      "log": os.path.join(self.td, "provisioned.csv")}}
-        os.environ["DEVICE_KEY_SECRET"] = "test-only"
-
-    def tearDown(self):
-        os.environ.pop("DEVICE_KEY_SECRET", None)
-        super().tearDown()
 
     def run_board(self, port):
         s = vf.BenchSession("Blipscope", VNAME, self.vcfg, self.pcfg)
