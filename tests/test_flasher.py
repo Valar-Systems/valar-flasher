@@ -261,6 +261,39 @@ class Bench(Rig):
         self.assertEqual(s.progress(), "1 of 1 this session")
 
 
+class PortAllowlist(Rig):
+    """--ports: a bench run on a machine with other boards attached touches only
+    the named port. Every Valar board is 303A, so VID cannot tell them apart."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved_ports = (vf._enumerate_ports, vf.PORT_ALLOW)
+        vf._enumerate_ports = lambda: [("COM6", 0x303A), ("COM15", 0x303A), ("COM18", 0x303A)]
+
+    def tearDown(self):
+        vf._enumerate_ports, vf.PORT_ALLOW = self.saved_ports
+        super().tearDown()
+
+    def test_control_without_ports_every_esp_board_is_seen(self):
+        vf.PORT_ALLOW = None
+        self.assertEqual(vf.list_ports(), ["COM6", "COM15", "COM18"])
+
+    def test_with_ports_only_the_named_board_is_seen(self):
+        vf.PORT_ALLOW = {"COM18"}
+        self.assertEqual(vf.list_ports(), ["COM18"])
+
+    def test_a_bench_run_touches_only_the_named_port(self):
+        vf.PORT_ALLOW = {"COM18"}
+        csv_path = os.path.join(self.td, "provisioned.csv")
+        pcfg = {"select": "variant", "variants": {VNAME: self.vcfg},
+                "provisioner": {"env": "DEVICE_KEY_SECRET",
+                                "command": os.path.join(HERE, "fake_provisioner.py"), "log": csv_path}}
+        s = vf.BenchSession("Blipscope", VNAME, self.vcfg, pcfg, count=1)
+        vf.bench_loop(s, threading.Event(), ports_fn=vf.list_ports, poll=0.01)
+        self.assertEqual(s.done, 1)
+        self.assertEqual(sorted({c["port"] for c in self.calls()}), ["COM18"])
+
+
 class Vendored(unittest.TestCase):
     def test_scan_image_matches_its_recorded_source(self):
         src = json.load(open(os.path.join(ROOT, "scan_image.SOURCE.json")))

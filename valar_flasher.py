@@ -396,18 +396,33 @@ def scan_gate(image_path, anchor, list_paths):
 
 
 # ---- serial + esptool ------------------------------------------------------
-def list_ports():
+# --ports: when set, the ONLY ports this run may see, and therefore touch. Every
+# Valar board presents the same Espressif USB ID, so on a machine with a board
+# that must not be flashed (a configured unit, another project's device) the
+# default "every ESP port" is exactly the wrong set. Applied inside list_ports,
+# the one function every flash and bench path gets its ports from.
+PORT_ALLOW = None
+
+
+def _enumerate_ports():
+    """[(device, vid)] for every serial port; [] if pyserial is missing."""
     try:
         from serial.tools import list_ports as lp
     except Exception:
         return []
+    return [(p.device, getattr(p, "vid", None)) for p in lp.comports()]
+
+
+def list_ports():
+    ports = _enumerate_ports()
+    if PORT_ALLOW is not None:
+        return [d for d, _ in ports if d and d.upper() in PORT_ALLOW]
     esp, other = [], []
-    for p in lp.comports():
-        vid = getattr(p, "vid", None)
+    for device, vid in ports:
         if vid in (0x303A, 0x10C4, 0x1A86, 0x0403):
-            esp.append(p.device)
-        elif p.device:
-            other.append(p.device)
+            esp.append(device)
+        elif device:
+            other.append(device)
     return esp if esp else other
 
 
@@ -1102,7 +1117,11 @@ if __name__ == "__main__":
     ap.add_argument("--bench", action="store_true", help="bench mode (console)")
     ap.add_argument("--count", type=int, default=0, help="bench: stop after this many new boards")
     ap.add_argument("--factory-reset", action="store_true", help="erase settings (console flash mode)")
+    ap.add_argument("--ports", help="comma-separated: the ONLY ports this run may touch, e.g. COM18")
     a = ap.parse_args()
+    if a.ports:
+        PORT_ALLOW = {p.strip().upper() for p in a.ports.split(",") if p.strip()}
+        print(f"[valar-flasher] only these ports will be touched: {', '.join(sorted(PORT_ALLOW))}")
     cfg = load_products()
     if a.console or a.bench or a.product or a.variant:
         sys.exit(run_console(cfg, a.product, a.variant, a.bench, a.count, a.factory_reset))

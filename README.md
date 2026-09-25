@@ -143,6 +143,12 @@ failure is listed again at the end. Console form:
 python valar_flasher.py --product Blipscope --bench --count 50
 ```
 
+**Other boards attached?** Every Valar board shows up with the same Espressif USB
+ID, so by default bench mode takes *every* one it sees. On a machine with a board
+that must not be touched (a configured unit, another project's device), name the
+ports: `--ports COM18` (comma-separate several). Nothing else is listed, so
+nothing else can be flashed.
+
 ## Under the hood
 
 Standard `esptool`. Chip-select products: `write_flash 0x0 <factory.bin>` — the
