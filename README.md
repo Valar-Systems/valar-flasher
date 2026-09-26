@@ -164,6 +164,12 @@ ID, so three guards stand between bench mode and the wrong board:
   type `yes`. It then flashes only those MACs; a board plugged in afterwards is
   refused, not flashed unlisted. Re-run to add it.
 - **`--ports COM18`** (comma-separate several): only those ports are ever seen.
+- **A tagged release only.** Bench mode writes an image set synced from a
+  tagged release and nothing else. A **prerelease** is refused at download
+  **and** at write unless you pass `--allow-prerelease`. A **local build** is
+  refused even with that flag. So is a cache synced before these checks
+  existed: Update firmware first. The manifest's app region must be the
+  release's own `firmware-<slug>.bin`, the binary OTA ships.
 
 ## Under the hood
 
