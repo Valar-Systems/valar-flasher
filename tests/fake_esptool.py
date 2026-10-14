@@ -5,6 +5,7 @@ asserted against.
 
     FAKE_ESPTOOL_LOG   the JSON-lines log (required)
     FAKE_CHIP          what flash_id reports (default ESP32-S3)
+    FAKE_CHIPS         JSON {port: chip} overriding FAKE_CHIP per port
     FAKE_MAC           what read_mac reports (default 00:00:00:00:00:01)
     FAKE_FAIL          a subcommand that exits 2 (e.g. write_flash)
     FAKE_FLASH         a file standing in for the board's flash, served by read_flash
@@ -22,6 +23,7 @@ def main(argv):
         opts[k] = args.pop(0)
     sub = (args.pop(0) if args else "").replace("-", "_")
     rec = {"sub": sub, "port": opts.get("--port"), "chip": opts.get("--chip")}
+    chip = json.loads(os.environ.get("FAKE_CHIPS") or "{}").get(rec["port"]) or os.environ.get("FAKE_CHIP", "ESP32-S3")
     if sub == "write_flash":
         rec["writes"] = [[int(o, 0), os.path.getsize(p), os.path.basename(p)]
                          for o, p in zip(args[0::2], args[1::2])]
@@ -33,7 +35,7 @@ def main(argv):
         print(f"A fatal error occurred: fake failure of {sub}")
         return 2
     if sub == "flash_id":
-        print(f"Detecting chip type... {os.environ.get('FAKE_CHIP', 'ESP32-S3')}")
+        print(f"Detecting chip type... {chip}")
         return 0
     if sub == "read_mac":
         print(f"MAC: {os.environ.get('FAKE_MAC', '00:00:00:00:00:01')}")
@@ -50,7 +52,7 @@ def main(argv):
         data = flash[off:off + size]
         with open(args[2], "wb") as f:
             f.write(data + b"\xff" * (size - len(data)))
-        print(f"Detecting chip type... {os.environ.get('FAKE_CHIP', 'ESP32-S3')}")
+        print(f"Detecting chip type... {chip}")
         print(f"MAC: {os.environ.get('FAKE_MAC', '00:00:00:00:00:01')}")
         print(f"Read {size} bytes at {off:#010x}")
         return 0

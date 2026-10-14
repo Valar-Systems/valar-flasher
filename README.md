@@ -62,13 +62,11 @@ Double-click the launcher for your OS:
 - **macOS:** `Valar Flasher (Mac).command`
 - **Linux:** `ValarFlasher.desktop` (or `./valar-flasher-linux.sh`)
 
-**Auto-flash starts OFF every time the window opens**, so a board that's already
-plugged in is never written by surprise. Pick the firmware in the dropdown, then
-click the **Auto-flash** switch (top right) to turn it on and work the pile: plug
-a board in → it auto-detects and flashes → **green DONE** → unplug → next. Click
-the switch again to turn it off whenever you need to plug a board in without
-flashing it; **Flash now** still flashes the attached board on demand. A **red**
-line means reseat the cable and replug that one.
+**Auto-flash starts OFF every time the window opens.** Pick the firmware in the
+dropdown, click the **Auto-flash** switch (top right) to turn it on, then work the
+pile: plug a board in → it auto-detects and flashes → **green DONE** → unplug →
+next. Click the switch again to turn it off. A **red** line means reseat the cable
+and replug that one.
 
 - **The firmware you picked is shown in large type** at the top, and the window
   opens on the firmware you used last time.
@@ -79,6 +77,28 @@ line means reseat the cable and replug that one.
   before, and whether it worked. Click **Flash log** to open it in your
   spreadsheet app. (If it's open in Excel while you flash, that board can't be
   added; the window says so and flashing carries on.)
+
+## Other boards connected? They're left alone
+
+The **Connected boards** list shows every board plugged in, each with an
+**Ignore** switch. **Any board connected while auto-flash is off is ignored
+automatically** — whatever was plugged in when you opened the window, or before
+you switched auto-flash on. An ignored board is never touched: not flashed, not
+even reset to read its chip. Boards you plug in **after** turning auto-flash on
+are flashed.
+
+So with two Blipscopes on the computer and a Glasscalibur to flash: open the
+window (both Blipscopes show *ignored*), turn auto-flash on, plug in the
+Glasscalibur — only it is flashed.
+
+- Want an ignored board flashed after all? Flip its switch off; with auto-flash
+  on it's flashed straight away, or click the **Flash** button on its row.
+- An ignored board stays ignored if you unplug it and plug it back in (it's
+  recognised by its serial number). A board that reports no serial number is
+  recognised only by its port.
+- **Flash now** flashes the one board that isn't ignored; with several, use the
+  **Flash** button on the row you want.
+- Bench mode leaves ignored boards out too.
 
 ## Wrong-firmware check
 
