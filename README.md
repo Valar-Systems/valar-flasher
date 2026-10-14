@@ -62,10 +62,13 @@ Double-click the launcher for your OS:
 - **macOS:** `Valar Flasher (Mac).command`
 - **Linux:** `ValarFlasher.desktop` (or `./valar-flasher-linux.sh`)
 
-Pick the firmware in the dropdown, then work the pile: plug a board in → it
-auto-detects and flashes → **green DONE** → unplug → next. Leave *Auto-flash on
-plug-in* ticked for hands-off flashing, or untick it and press **Flash now** per
-board. A **red** line means reseat the cable and replug that one.
+**Auto-flash starts OFF every time the window opens**, so a board that's already
+plugged in is never written by surprise. Pick the firmware in the dropdown, then
+click the **Auto-flash** switch (top right) to turn it on and work the pile: plug
+a board in → it auto-detects and flashes → **green DONE** → unplug → next. Click
+the switch again to turn it off whenever you need to plug a board in without
+flashing it; **Flash now** still flashes the attached board on demand. A **red**
+line means reseat the cable and replug that one.
 
 ## VAL3101 shares the VAL3100's chip
 
