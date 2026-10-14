@@ -37,6 +37,10 @@ the bench holds DEVICE_KEY_SECRET and nothing here reads it. The token is never
 typed into the window and never printed; the flasher checks only that the file
 exists, and hands its PATH (not its contents) to the provisioner.
 
+IN THE WINDOW, a board that shows up while auto-flash is off is IGNORED (BoardList):
+whatever was plugged in before auto-flash was switched on is never touched, not even
+reset, until the operator flips its switch in the Connected boards list.
+
 BEFORE A CHIP-SELECT WRITE the name of the firmware already on the board is read
 from its app descriptor. Ropener (VAL3100), Generic board and Glasscalibur share
 the ESP32-C6, so if that name is ANOTHER product's, the operator is asked first.
@@ -682,6 +686,99 @@ def _port_serials():
     return {p.device: getattr(p, "serial_number", None) for p in lp.comports()}
 
 
+def port_details():
+    """{device: (description, USB serial number)} from the OS -- no port is opened,
+    so listing a board never resets it."""
+    try:
+        from serial.tools import list_ports as lp
+    except Exception:
+        return {}
+    out = {}
+    for p in lp.comports():
+        desc = (getattr(p, "description", "") or "").replace(f"({p.device})", "").strip()
+        out[p.device] = ("" if desc in ("n/a", p.device) else desc, getattr(p, "serial_number", None))
+    return out
+
+
+class BoardList:
+    """The boards the window can see, and which of them it must leave alone.
+
+    A board that shows up while auto-flash is OFF is IGNORED automatically:
+    whatever is plugged in when the window opens, or before auto-flash is switched
+    on, is never touched -- not even reset to read its chip -- until the operator
+    flips its switch. A board plugged in while auto-flash is ON is flashed. An
+    ignored board stays ignored if it is unplugged and plugged back in, recognised
+    by its USB serial number (on these chips, its MAC); a board that reports none
+    is known only by its port. A protected board (protected-macs.json) is always
+    ignored, and its switch cannot be flipped."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.rows = {}               # port -> {"key", "ignore", "protected", "desc", "mac", "info", "status"}
+        self.ignored_keys = set()    # serial numbers of ignored boards unplugged this session
+
+    def update(self, ports, auto_on, details=None):
+        """Bring the list in line with the ports present now. True if it changed."""
+        details = details or {}
+        prot = None                  # read only when a new board appears: this runs every 0.8 s
+        changed = False
+        with self.lock:
+            for port in [p for p in self.rows if p not in ports]:
+                row = self.rows.pop(port)
+                if row["key"] and row["ignore"]:
+                    self.ignored_keys.add(row["key"])
+                changed = True
+            for port in ports:
+                if port in self.rows:
+                    continue
+                desc, serial = details.get(port, ("", None))
+                mac = norm_mac(serial)
+                if prot is None:
+                    try:
+                        prot = load_protected()
+                    except ProtectedListError:
+                        prot = {}
+                protected = bool(mac and mac in prot)
+                self.rows[port] = {"key": serial or None, "protected": protected, "desc": desc, "mac": mac,
+                                   "ignore": protected or not auto_on or (serial in self.ignored_keys),
+                                   "info": "", "status": ""}
+                changed = True
+        return changed
+
+    def toggle(self, port):
+        """Flip a board's switch. Returns its new state, or None if it can't be flipped."""
+        with self.lock:
+            row = self.rows.get(port)
+            if not row or row["protected"]:
+                return None
+            row["ignore"] = not row["ignore"]
+            if not row["ignore"]:
+                self.ignored_keys.discard(row["key"])
+            return row["ignore"]
+
+    def flashable(self, ports):
+        """The listed, not-ignored ports among `ports` -- the only ones flashing may touch."""
+        with self.lock:
+            return [p for p in ports if p in self.rows and not self.rows[p]["ignore"]]
+
+    def ignored_ports(self):
+        with self.lock:
+            return {p for p, r in self.rows.items() if r["ignore"]}
+
+    def note(self, port, status=None, info=None):
+        with self.lock:
+            row = self.rows.get(port)
+            if row:
+                if status is not None:
+                    row["status"] = status
+                if info is not None:
+                    row["info"] = info
+
+    def snapshot(self):
+        with self.lock:
+            return [(p, dict(r)) for p, r in sorted(self.rows.items())]
+
+
 def usb_mac(port):
     return norm_mac(_port_serials().get(port))
 
@@ -1216,16 +1313,18 @@ def run_gui(cfg):
 
     root = tk.Tk()
     root.title("Valar Flasher")
-    root.geometry("640x680")
+    root.geometry("640x760")
     root.configure(bg="#111418")
 
     q = queue.Queue()
-    # Auto-flash starts OFF on every launch: a board already plugged in when the
-    # window opens is not written until the operator flips the switch.
+    # Auto-flash starts OFF on every launch, and every board that shows up while
+    # it is off is IGNORED (BoardList): a board already plugged in when the window
+    # opens is never touched unless the operator flips its switch.
     state = {"busy": False, "auto": False, "force": "Auto",
              "product": default_product, "handled": {}, "variant": None,
              "bench": None, "bench_stop": None,
              "sound": load_settings().get("sound", True), "update": None}
+    board_list = BoardList()
 
     def log(m): q.put(("log", m))
     def set_status(m, c): q.put(("status", (m, c)))
@@ -1276,15 +1375,18 @@ def run_gui(cfg):
                         highlightthickness=0, cursor="hand2")
     auto_sw.pack(side="left")
 
+    def draw_switch(canvas, on, on_color):
+        track = on_color if on else "#6e7681"
+        canvas.delete("all")
+        canvas.create_oval(2, 2, 22, 22, fill=track, outline=track)
+        canvas.create_oval(22, 2, 42, 22, fill=track, outline=track)
+        canvas.create_rectangle(12, 2, 32, 22, fill=track, outline=track)
+        knob = 24 if on else 4
+        canvas.create_oval(knob, 4, knob + 16, 20, fill="#ffffff", outline="")
+
     def draw_auto():
         on = state["auto"]
-        track = "#3fb950" if on else "#6e7681"
-        auto_sw.delete("all")
-        auto_sw.create_oval(2, 2, 22, 22, fill=track, outline=track)
-        auto_sw.create_oval(22, 2, 42, 22, fill=track, outline=track)
-        auto_sw.create_rectangle(12, 2, 32, 22, fill=track, outline=track)
-        knob = 24 if on else 4
-        auto_sw.create_oval(knob, 4, knob + 16, 20, fill="#ffffff", outline="")
+        draw_switch(auto_sw, on, "#3fb950")
         auto_lbl.config(text=f"Auto-flash: {'ON' if on else 'OFF'}",
                         fg="#3fb950" if on else "#9aa0a6")
 
@@ -1292,11 +1394,14 @@ def run_gui(cfg):
         state["auto"] = not state["auto"]
         draw_auto()
         if state["auto"]:
-            log("— auto-flash ON: boards are flashed as they're plugged in —")
+            n = len(board_list.ignored_ports())
+            log("— auto-flash ON: boards you plug in now are flashed"
+                + (f"; {n} ignored board(s) are left alone" if n else "") + " —")
         else:
             log("— auto-flash OFF: nothing is flashed until you turn it on or click Flash now —")
         if not state["busy"] and not state["bench"]:
             set_status("Plug in a board…" if state["auto"] else "Auto-flash is OFF", "#e6e6e6")
+        q.put(("boards", None))
 
     auto_lbl.bind("<Button-1>", toggle_auto)
     auto_sw.bind("<Button-1>", toggle_auto)
@@ -1315,6 +1420,8 @@ def run_gui(cfg):
     count_var = tk.StringVar(value="0")
     count_entry = tk.Entry(opts, textvariable=count_var, width=5)
 
+    boards_frame = tk.Frame(root, bg="#161b22", padx=8, pady=6)
+    boards_frame.pack(fill="x", padx=12, pady=(8, 0))
     tiles_frame = tk.Frame(root, bg="#111418")
     logbox = scrolledtext.ScrolledText(root, height=10, bg="#0b0d10", fg="#c9d1d9",
                                        insertbackground="#c9d1d9", font=("Menlo", 10),
@@ -1400,16 +1507,27 @@ def run_gui(cfg):
 
     def do_one_flash(port):
         state["busy"] = True
+        if port in board_list.ignored_ports():      # the last word, whoever asked
+            log(f"[{port}] is ignored in the board list — not touched.")
+            state["busy"] = False
+            return
         p, v = state["product"], state["variant"]
         rec = {"product": p, "variant": v, "port": port}
+        board_list.note(port, status="flashing…")
+        q.put(("boards", None))
 
         def finish(result, status_text, log_text, detail):
-            """Every outcome ends here: the status line, the log, the flash record, the sound."""
+            """Every outcome ends here: the status line, the log, the board list,
+            the flash record, the sound."""
             ok = result == "DONE"
             if ok:
                 counts["n"] += 1; q.put(("count", counts["n"]))
             set_status(status_text, "#3fb950" if ok else "#e8c15a" if result == "SKIPPED" else "#e5534b")
             log(log_text)
+            board_list.note(port, status=result,
+                            info=" · ".join(x for x in (rec.get("chip"), f"had {rec['was']}" if rec.get("was")
+                                                        else None) if x))
+            q.put(("boards", None))
             note = record_flash(result=result, detail=detail, **rec)
             if note:
                 log(note)
@@ -1491,25 +1609,87 @@ def run_gui(cfg):
     def worker():
         while True:
             if not state["busy"] and not state["bench"]:
-                present = set(list_ports())
+                present = list_ports()
+                # The list first, so a board that just appeared is ignored or not
+                # (by whether auto-flash is on) before anything can touch it.
+                if board_list.update(present, state["auto"], port_details()):
+                    q.put(("boards", None))
                 # Forget unplugged ports even while auto-flash is off, so a board
                 # swapped in on the same port is new when the switch goes on.
                 for p in list(state["handled"]):
                     if p not in present:
                         del state["handled"][p]
                 if state["auto"]:
-                    for p in present:
+                    for p in board_list.flashable(present):
                         if p not in state["handled"]:
                             do_one_flash(p); break
             time.sleep(0.8)
 
+    def flash_board(port):
+        if state["busy"] or state["bench"]:
+            log("Busy — wait for the current board to finish.")
+            return
+        threading.Thread(target=do_one_flash, args=(port,), daemon=True).start()
+
     def manual_flash():
         if state["busy"] or state["bench"]:
             return
-        ports = list_ports()
+        ports = board_list.flashable(list_ports())
         if not ports:
-            log("No board detected. Plug one in."); return
-        threading.Thread(target=do_one_flash, args=(ports[0],), daemon=True).start()
+            log("No board to flash — plug one in, or switch off Ignore on the board you want."); return
+        if len(ports) > 1:
+            log("More than one board can be flashed — click Flash next to the one you want."); return
+        flash_board(ports[0])
+
+    def toggle_ignore(port):
+        now = board_list.toggle(port)
+        if now is None:
+            return
+        log(f"— {port} ignored: it won't be touched —" if now else
+            f"— {port} no longer ignored: it will be flashed"
+            + (" now (auto-flash is on)" if state["auto"] else " when auto-flash is on or you click Flash")
+            + " —")
+        render_boards()
+
+    def render_boards():
+        """One row per connected board: its Ignore switch, what is known of it, its last result."""
+        for w in boards_frame.winfo_children():
+            w.destroy()
+        rows = board_list.snapshot()
+        head = tk.Frame(boards_frame, bg="#161b22"); head.pack(fill="x")
+        tk.Label(head, text="Connected boards", font=("Helvetica", 11, "bold"),
+                 bg="#161b22", fg="#c9d1d9").pack(side="left")
+        tk.Label(head, text=("none" if not rows else
+                             "connected while auto-flash is off = ignored automatically"),
+                 font=("Helvetica", 9), bg="#161b22", fg="#6e7681").pack(side="left", padx=8)
+        result_color = {"DONE": "#3fb950", "SKIPPED": "#e8c15a", "flashing…": "#e8c15a"}
+        for port, r in rows:
+            line = tk.Frame(boards_frame, bg="#161b22"); line.pack(fill="x", pady=1)
+            if r["protected"]:
+                tk.Label(line, text="PROTECTED", width=9, font=("Helvetica", 9, "bold"),
+                         bg="#161b22", fg="#e5534b").pack(side="left", padx=(0, 4))
+            else:
+                sw = tk.Canvas(line, width=44, height=24, bg="#161b22", highlightthickness=0, cursor="hand2")
+                draw_switch(sw, r["ignore"], "#e8c15a")
+                sw.bind("<Button-1>", lambda _e, p=port: toggle_ignore(p))
+                sw.pack(side="left")
+                tk.Label(line, text="Ignore", width=6, anchor="w", font=("Helvetica", 9),
+                         bg="#161b22", fg="#e8c15a" if r["ignore"] else "#6e7681").pack(side="left")
+            tk.Label(line, text=os.path.basename(port), font=("Helvetica", 10, "bold"),
+                     bg="#161b22", fg="#c9d1d9").pack(side="left", padx=(4, 6))
+            about = " · ".join(x for x in (r["info"] or r["desc"], r["mac"]) if x)
+            tk.Label(line, text=about[:44], font=("Helvetica", 9), bg="#161b22",
+                     fg="#9aa0a6").pack(side="left")
+            tk.Button(line, text="Flash", state="disabled" if r["ignore"] else "normal",
+                      command=lambda p=port: flash_board(p)).pack(side="right")
+            if r["ignore"]:
+                text, color = "ignored", "#6e7681"
+            elif r["status"]:
+                text, color = r["status"], result_color.get(r["status"], "#e5534b")
+            else:
+                text, color = ("will flash" if state["auto"] else "flashes when auto-flash is on"), "#9aa0a6"
+            tk.Label(line, text=text, font=("Helvetica", 9, "bold"), bg="#161b22",
+                     fg=color).pack(side="right", padx=6)
 
     def sync_selected(force=False):
         def go():
@@ -1583,7 +1763,7 @@ def run_gui(cfg):
                              on_change=lambda: q.put(("tiles", None)))
             if PORT_ALLOW is None:
                 from tkinter import messagebox
-                targets, lines = bench_targets()
+                targets, lines = bench_targets(board_list.ignored_ports())
                 if not targets or not messagebox.askyesno(
                         "Bench mode — confirm boards",
                         "\n".join(lines) + f"\n\nFlash AND provision these {len(targets)} board(s)? "
@@ -1593,6 +1773,7 @@ def run_gui(cfg):
                     return
                 s.allowed_macs = set(targets.values())
                 s.excluded_ports = set(list_ports()) - set(targets)
+            s.excluded_ports |= board_list.ignored_ports()
             stop = threading.Event()
             state["bench"], state["bench_stop"] = s, stop
             tiles_frame.pack(fill="x", padx=12, before=logbox)
@@ -1650,6 +1831,8 @@ def run_gui(cfg):
                     version.config(text=payload)
                 elif kind == "tiles":
                     render_tiles()
+                elif kind == "boards":
+                    render_boards()
                 elif kind == "ask":
                     from tkinter import messagebox
                     title, text, box = payload
@@ -1682,14 +1865,15 @@ def run_gui(cfg):
             sync_firmware(state["product"], pcfg(), log)
         refresh_version()
         log("Ready. Plug in a board." if state["auto"] else
-            "Ready. Auto-flash is OFF — switch it on (top right) to flash boards as "
-            "they're plugged in, or click Flash now.")
+            "Ready. Auto-flash is OFF — switch it on (top right), then plug in the boards to flash. "
+            "Boards connected before that are ignored (see Connected boards) until you flip their switch.")
         changed = app_update_check(log)
         if changed:
             log(f"A newer version of Valar Flasher is available ({len(changed)} file(s) changed) "
                 f"— click Update app at the top.")
             q.put(("update", changed))
     refresh_layout()
+    render_boards()
     threading.Thread(target=startup, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     root.after(120, pump)
@@ -1701,14 +1885,17 @@ def run_gui(cfg):
 # ===========================================================================
 # Console fallback
 # ===========================================================================
-def bench_targets():
+def bench_targets(ignored=()):
     """({port: mac} bench mode would flash, [lines to show]). Reads USB serial
-    numbers only -- no board is opened or reset to build this list."""
+    numbers only -- no board is opened or reset to build this list. `ignored`:
+    ports the window's board list says to leave alone."""
     prot = load_protected()
     targets, lines = {}, ["Bench mode sees these boards:"]
     for port in list_ports():
         m = usb_mac(port)
-        if not m:
+        if port in ignored:
+            lines.append(f"  {port:8} {m or 'MAC unknown':17}  -- EXCLUDED: ignored in the board list")
+        elif not m:
             lines.append(f"  {port:8} MAC unknown        -- EXCLUDED (cannot identify it without touching it)")
         elif m in prot:
             lines.append(f"  {port:8} {m}  -- EXCLUDED: PROTECTED ({prot[m]})")

@@ -908,6 +908,64 @@ class Sounds(unittest.TestCase):
         self.assertEqual(fell_back, [1])
 
 
+class ConnectedBoards(Rig):
+    """BoardList: which connected boards the window may touch."""
+    BLIP1, BLIP2, GLASS = "COM3", "COM4", "COM7"
+    DETAILS = {"COM3": ("Blipscope", "90:70:69:32:6E:64"), "COM4": ("Blipscope", "90:70:69:31:E2:08"),
+               "COM7": ("USB JTAG/serial debug unit", "40:4C:CA:57:2A:08"), "COM9": ("CH340", None)}
+
+    def setUp(self):
+        super().setUp()
+        self.b = vf.BoardList()
+
+    def test_boards_already_connected_are_ignored_and_new_ones_flash(self):
+        self.b.update([self.BLIP1, self.BLIP2], auto_on=False, details=self.DETAILS)      # window opens
+        self.assertEqual(self.b.flashable([self.BLIP1, self.BLIP2]), [])
+        self.b.update([self.BLIP1, self.BLIP2, self.GLASS], auto_on=True, details=self.DETAILS)
+        self.assertEqual(self.b.flashable([self.BLIP1, self.BLIP2, self.GLASS]), [self.GLASS])
+
+    def test_a_board_plugged_in_while_auto_flash_is_off_stays_ignored_when_it_goes_on(self):
+        self.b.update([self.GLASS], auto_on=False, details=self.DETAILS)
+        self.b.update([self.GLASS], auto_on=True, details=self.DETAILS)
+        self.assertEqual(self.b.flashable([self.GLASS]), [], "turning auto-flash on flashes nothing already there")
+        self.assertFalse(self.b.toggle(self.GLASS), "CONTROL: flipping its switch lets it be flashed")
+        self.assertEqual(self.b.flashable([self.GLASS]), [self.GLASS])
+
+    def test_an_ignored_board_stays_ignored_when_replugged_known_by_its_serial(self):
+        self.b.update([self.BLIP1], auto_on=False, details=self.DETAILS)
+        self.b.update([], auto_on=True, details=self.DETAILS)                  # unplugged...
+        self.b.update(["COM12"], auto_on=True,                                 # ...back, on another port
+                      details={"COM12": ("Blipscope", "90:70:69:32:6E:64")})
+        self.assertEqual(self.b.flashable(["COM12"]), [])
+
+    def test_a_board_with_no_serial_is_known_only_by_its_port(self):
+        self.b.update(["COM9"], auto_on=False, details=self.DETAILS)
+        self.b.update([], auto_on=True, details=self.DETAILS)
+        self.b.update(["COM9"], auto_on=True, details=self.DETAILS)
+        self.assertEqual(self.b.flashable(["COM9"]), ["COM9"], "replugged while auto-flash is on = a new board")
+
+    def test_a_protected_board_is_ignored_and_cannot_be_switched_on(self):
+        json.dump({"macs": {"40:4c:ca:57:2a:08": "bench unit"}}, open(vf.PROTECTED_FILE, "w"))
+        self.b.update([self.GLASS], auto_on=True, details=self.DETAILS)
+        self.assertEqual(self.b.flashable([self.GLASS]), [])
+        self.assertIsNone(self.b.toggle(self.GLASS))
+        self.assertTrue(self.b.snapshot()[0][1]["protected"])
+
+    def test_an_unlisted_port_is_not_flashable(self):
+        self.assertEqual(self.b.flashable([self.GLASS]), [], "nothing is touched before the list has seen it")
+
+    def test_bench_mode_excludes_boards_ignored_in_the_window(self):
+        vf._port_serials = lambda: {p: s for p, (d, s) in self.DETAILS.items()}
+        saved = vf.list_ports
+        vf.list_ports = lambda: [self.BLIP1, self.BLIP2]
+        try:
+            targets, lines = vf.bench_targets(ignored={self.BLIP2})
+        finally:
+            vf.list_ports = saved
+        self.assertEqual(list(targets), [self.BLIP1])
+        self.assertTrue(any(self.BLIP2 in l and "ignored" in l for l in lines))
+
+
 class Vendored(unittest.TestCase):
     def test_scan_image_matches_its_recorded_source(self):
         src = json.load(open(os.path.join(ROOT, "scan_image.SOURCE.json")))
