@@ -37,9 +37,9 @@ the bench holds DEVICE_KEY_SECRET and nothing here reads it. The token is never
 typed into the window and never printed; the flasher checks only that the file
 exists, and hands its PATH (not its contents) to the provisioner.
 
-IN THE WINDOW, a board that shows up while auto-flash is off is IGNORED (BoardList):
-whatever was plugged in before auto-flash was switched on is never touched, not even
-reset, until the operator flips its switch in the Connected boards list.
+IN THE WINDOW, the boards already connected when it opens are IGNORED (BoardList):
+never touched, not even reset, until the operator flips its switch in the Connected
+boards list. Boards plugged in after that are flashed.
 
 BEFORE A CHIP-SELECT WRITE the name of the firmware already on the board is read
 from its app descriptor. Ropener (VAL3100), Generic board and Glasscalibur share
@@ -703,24 +703,29 @@ def port_details():
 class BoardList:
     """The boards the window can see, and which of them it must leave alone.
 
-    A board that shows up while auto-flash is OFF is IGNORED automatically:
-    whatever is plugged in when the window opens, or before auto-flash is switched
-    on, is never touched -- not even reset to read its chip -- until the operator
-    flips its switch. A board plugged in while auto-flash is ON is flashed. An
-    ignored board stays ignored if it is unplugged and plugged back in, recognised
-    by its USB serial number (on these chips, its MAC); a board that reports none
-    is known only by its port. A protected board (protected-macs.json) is always
-    ignored, and its switch cannot be flipped."""
+    The boards ALREADY CONNECTED when the window opens (the first update) are
+    IGNORED automatically: never touched -- not even reset to read its chip --
+    until the operator flips its switch. Every board plugged in after that is
+    flashed, whether auto-flash was on or off when it arrived: a board plugged in
+    with the flasher open is a board to flash. (Ignoring boards that arrived while
+    auto-flash was off was tried, and it ignored the very board the operator had
+    just plugged in.) An IGNORED board stays ignored if it is unplugged and plugged
+    back in, recognised by its USB serial number (on these chips, its MAC); a board
+    that reports none is known only by its port. A protected board
+    (protected-macs.json) is always ignored, and its switch cannot be flipped."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.rows = {}               # port -> {"key", "ignore", "protected", "desc", "mac", "info", "status"}
         self.ignored_keys = set()    # serial numbers of ignored boards unplugged this session
+        self.opened = False          # set by the first update: what it sees was already connected
 
-    def update(self, ports, auto_on, details=None):
+    def update(self, ports, details=None):
         """Bring the list in line with the ports present now. True if it changed."""
         details = details or {}
         prot = None                  # read only when a new board appears: this runs every 0.8 s
+        already_connected = not self.opened
+        self.opened = True
         changed = False
         with self.lock:
             for port in [p for p in self.rows if p not in ports]:
@@ -740,7 +745,7 @@ class BoardList:
                         prot = {}
                 protected = bool(mac and mac in prot)
                 self.rows[port] = {"key": serial or None, "protected": protected, "desc": desc, "mac": mac,
-                                   "ignore": protected or not auto_on or (serial in self.ignored_keys),
+                                   "ignore": protected or already_connected or (serial in self.ignored_keys),
                                    "info": "", "status": ""}
                 changed = True
         return changed
@@ -1317,9 +1322,9 @@ def run_gui(cfg):
     root.configure(bg="#111418")
 
     q = queue.Queue()
-    # Auto-flash starts OFF on every launch, and every board that shows up while
-    # it is off is IGNORED (BoardList): a board already plugged in when the window
-    # opens is never touched unless the operator flips its switch.
+    # Auto-flash starts OFF on every launch, and every board already plugged in
+    # when the window opens is IGNORED (BoardList): never touched unless the
+    # operator flips its switch.
     state = {"busy": False, "auto": False, "force": "Auto",
              "product": default_product, "handled": {}, "variant": None,
              "bench": None, "bench_stop": None,
@@ -1394,13 +1399,16 @@ def run_gui(cfg):
         state["auto"] = not state["auto"]
         draw_auto()
         if state["auto"]:
-            n = len(board_list.ignored_ports())
-            log("— auto-flash ON: boards you plug in now are flashed"
-                + (f"; {n} ignored board(s) are left alone" if n else "") + " —")
+            n = sum(1 for _p, r in board_list.snapshot() if r["ignore"] and not r["protected"])
+            log("— auto-flash ON: every board that isn't ignored is flashed"
+                + (f"; {n} ignored board(s) are left alone — flip a switch to flash one" if n else "") + " —")
         else:
             log("— auto-flash OFF: nothing is flashed until you turn it on or click Flash now —")
         if not state["busy"] and not state["bench"]:
-            set_status("Plug in a board…" if state["auto"] else "Auto-flash is OFF", "#e6e6e6")
+            ignored = sum(1 for _p, r in board_list.snapshot() if r["ignore"] and not r["protected"])
+            set_status("Auto-flash is OFF" if not state["auto"] else
+                       f"Plug in a board…  ({ignored} ignored — see the list)" if ignored else
+                       "Plug in a board…", "#e6e6e6")
         q.put(("boards", None))
 
     auto_lbl.bind("<Button-1>", toggle_auto)
@@ -1610,9 +1618,9 @@ def run_gui(cfg):
         while True:
             if not state["busy"] and not state["bench"]:
                 present = list_ports()
-                # The list first, so a board that just appeared is ignored or not
-                # (by whether auto-flash is on) before anything can touch it.
-                if board_list.update(present, state["auto"], port_details()):
+                # The list first, so nothing can touch a board the list hasn't seen
+                # (and, on the first pass, marked ignored as already connected).
+                if board_list.update(present, port_details()):
                     q.put(("boards", None))
                 # Forget unplugged ports even while auto-flash is off, so a board
                 # swapped in on the same port is new when the switch goes on.
@@ -1660,13 +1668,13 @@ def run_gui(cfg):
         tk.Label(head, text="Connected boards", font=("Helvetica", 11, "bold"),
                  bg="#161b22", fg="#c9d1d9").pack(side="left")
         tk.Label(head, text=("none" if not rows else
-                             "connected while auto-flash is off = ignored automatically"),
+                             "already connected when the flasher opened = ignored"),
                  font=("Helvetica", 9), bg="#161b22", fg="#6e7681").pack(side="left", padx=8)
         result_color = {"DONE": "#3fb950", "SKIPPED": "#e8c15a", "flashing…": "#e8c15a"}
         for port, r in rows:
             line = tk.Frame(boards_frame, bg="#161b22"); line.pack(fill="x", pady=1)
             if r["protected"]:
-                tk.Label(line, text="PROTECTED", width=9, font=("Helvetica", 9, "bold"),
+                tk.Label(line, text="PROTECTED", width=11, font=("Helvetica", 9, "bold"),
                          bg="#161b22", fg="#e5534b").pack(side="left", padx=(0, 4))
             else:
                 sw = tk.Canvas(line, width=44, height=24, bg="#161b22", highlightthickness=0, cursor="hand2")
@@ -1687,7 +1695,7 @@ def run_gui(cfg):
             elif r["status"]:
                 text, color = r["status"], result_color.get(r["status"], "#e5534b")
             else:
-                text, color = ("will flash" if state["auto"] else "flashes when auto-flash is on"), "#9aa0a6"
+                text, color = ("will flash" if state["auto"] else "ready to flash"), "#58a6ff"
             tk.Label(line, text=text, font=("Helvetica", 9, "bold"), bg="#161b22",
                      fg=color).pack(side="right", padx=6)
 
@@ -1865,8 +1873,9 @@ def run_gui(cfg):
             sync_firmware(state["product"], pcfg(), log)
         refresh_version()
         log("Ready. Plug in a board." if state["auto"] else
-            "Ready. Auto-flash is OFF — switch it on (top right), then plug in the boards to flash. "
-            "Boards connected before that are ignored (see Connected boards) until you flip their switch.")
+            "Ready. Auto-flash is OFF — switch it on (top right) to flash the boards you plug in. "
+            "Boards that were already connected when the flasher opened are ignored (see Connected "
+            "boards) until you flip their switch.")
         changed = app_update_check(log)
         if changed:
             log(f"A newer version of Valar Flasher is available ({len(changed)} file(s) changed) "
