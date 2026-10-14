@@ -37,13 +37,18 @@ the bench holds DEVICE_KEY_SECRET and nothing here reads it. The token is never
 typed into the window and never printed; the flasher checks only that the file
 exists, and hands its PATH (not its contents) to the provisioner.
 
+BEFORE A CHIP-SELECT WRITE the name of the firmware already on the board is read
+from its app descriptor. Ropener (VAL3100), Generic board and Glasscalibur share
+the ESP32-C6, so if that name is ANOTHER product's, the operator is asked first.
+
 For each product it checks the repo's latest GitHub release on launch and caches
-the download (offline? it uses whatever is cached). Runs a small Tk window; falls
-back to a console loop if Tk is unavailable. Requires esptool (the launcher
-installs it for you).
+the download (offline? it uses whatever is cached), and it checks this repo's main
+branch for a newer flasher, which the window offers to install. Every board it
+tries is added to flash-log.csv. Runs a small Tk window; falls back to a console
+loop if Tk is unavailable. Requires esptool (the launcher installs it for you).
 """
 import os, sys, json, subprocess, threading, queue, time, urllib.request
-import csv, hashlib, re, shutil, tempfile
+import base64, csv, hashlib, re, shutil, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.join(HERE, "firmware")
@@ -113,6 +118,45 @@ def load_products():
 
 def is_variant(pcfg):
     return pcfg.get("select", "chip") == "variant"
+
+
+# ---- remembered choices ------------------------------------------------------
+# The firmware (and variant) last picked on this machine, and whether sounds are
+# on. A convenience only: a missing or unreadable file just means the defaults.
+SETTINGS_FILE = os.environ.get("VALAR_FLASHER_SETTINGS") or os.path.join(
+    os.path.expanduser("~"), ".config", "valar-flasher", "settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            s = json.load(f)
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**changes):
+    s = _merge(load_settings(), changes)
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=1)
+    except OSError:
+        pass
+
+
+def starting_product(cfg):
+    """The firmware last picked here if it still exists, else products.json's default."""
+    products = cfg["products"]
+    last = load_settings().get("product")
+    return last if last in products else (cfg.get("default") or next(iter(products)))
+
+
+def starting_variant(product, pcfg):
+    names = list((pcfg.get("variants") or {}).keys())
+    last = (load_settings().get("variants") or {}).get(product)
+    return last if last in names else (pcfg.get("default_variant") or names[0])
 
 
 # ---- GitHub firmware sync (per product) ------------------------------------
@@ -210,6 +254,118 @@ def sync_firmware(product, pcfg, log, force=False):
     log(f"{product} updated to {tag} ({got} file(s))." if got
         else f"No matching factory bins found in {repo} latest release.")
     return (tag if got else cached_tag(product))
+
+
+# ---- updating the flasher itself ---------------------------------------------
+# The firmware is kept current from GitHub; this keeps the FLASHER current the
+# same way, so nobody has to download a new ZIP. Each file is compared with main
+# by git's own blob hash, so there is no version number to remember to bump. A git
+# checkout is left to git.
+APP_REPO = "Valar-Systems/valar-flasher"
+APP_BRANCH = "main"
+UPDATE_SKIP = ("tests/", ".github/")     # development only; not needed to flash
+UPDATE_BACKUP = os.path.join(HERE, ".update-backup")
+
+
+def _blob_sha(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _local_blob_sha(data):
+    """What git would store these bytes as: text LF-normalised (.gitattributes is
+    text=auto), so a copy with Windows line endings still matches."""
+    if b"\0" not in data[:8000]:
+        data = data.replace(b"\r\n", b"\n")
+    return _blob_sha(data)
+
+
+def _gh_json(url, timeout=30):
+    req = urllib.request.Request(url, headers=_gh_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def app_update_check(log=lambda m: None):
+    """[{path, sha, mode}] for every file on main that differs from, or is missing
+    in, this folder. [] when up to date; None when it cannot tell (offline, or
+    this folder is a git checkout)."""
+    if os.path.isdir(os.path.join(HERE, ".git")):
+        return None
+    try:
+        tree = _gh_json(f"https://api.github.com/repos/{APP_REPO}/git/trees/{APP_BRANCH}?recursive=1")
+    except Exception as e:
+        log(f"Couldn't check for a newer flasher: {e}")
+        return None
+    if tree.get("truncated"):
+        return None
+    changed = []
+    for e in tree.get("tree", []):
+        path = e.get("path", "")
+        parts = path.split("/")
+        if (e.get("type") != "blob" or e.get("mode") == "120000" or path.startswith(UPDATE_SKIP)
+                or ".." in parts or path.startswith("/")):
+            continue
+        try:
+            with open(os.path.join(HERE, *parts), "rb") as f:
+                same = _local_blob_sha(f.read()) == e["sha"]
+        except OSError:
+            same = False
+        if not same:
+            changed.append({"path": path, "sha": e["sha"], "mode": e.get("mode", "100644")})
+    return changed
+
+
+def app_update_apply(changed, log=lambda m: None):
+    """Download every changed file and check it against its hash, and only then
+    replace them, keeping each old file in .update-backup/<time>/. (ok, message).
+    A failed download changes nothing; a failed write puts back what it replaced."""
+    staged = []
+    try:
+        for e in changed:
+            blob = _gh_json(f"https://api.github.com/repos/{APP_REPO}/git/blobs/{e['sha']}", timeout=60)
+            data = base64.b64decode(blob.get("content", ""))
+            if _blob_sha(data) != e["sha"]:
+                raise RuntimeError(f"{e['path']} did not match its hash")
+            if e["path"].endswith(".bat"):          # .gitattributes: *.bat text eol=crlf
+                data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+            staged.append((e["path"], data, e["mode"]))
+    except Exception as ex:
+        return False, f"Update not installed: {ex}. Nothing was changed."
+    backup = os.path.join(UPDATE_BACKUP, time.strftime("%Y%m%d-%H%M%S"))
+    done = []                                       # (dest, backup copy or None)
+    tmp = None
+    try:
+        for path, data, mode in staged:
+            dest = os.path.join(HERE, *path.split("/"))
+            saved = None
+            if os.path.exists(dest):
+                saved = os.path.join(backup, *path.split("/"))
+                os.makedirs(os.path.dirname(saved), exist_ok=True)
+                shutil.copy2(dest, saved)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + ".new"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            if mode == "100755" or (saved and os.access(saved, os.X_OK)):
+                os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)
+            done.append((dest, saved))
+            log(f"  updated {path}")
+    except OSError as ex:
+        for dest, saved in reversed(done):
+            try:
+                if saved:
+                    shutil.copy2(saved, dest)
+                else:
+                    os.remove(dest)
+            except OSError:
+                pass
+        if tmp and os.path.exists(tmp):
+            os.remove(tmp)
+        return False, (f"Update not installed: couldn't write {ex.filename or 'a file'} "
+                       f"({ex.strerror or ex}). Your old files were put back.")
+    return True, (f"Updated {len(done)} file(s). Close and reopen Valar Flasher to use the new version. "
+                  f"The old files are in {backup}.")
 
 
 # ---- variant products: manifest-driven -------------------------------------
@@ -549,19 +705,132 @@ def run_esptool(args, timeout=180):
         return 1, "esptool is not installed — run the Setup launcher first."
 
 
-def detect_chip(port):
-    rc, out = run_esptool(["--port", port, "flash_id"], timeout=40)
+def _chip_in(out):
     low = out.lower()
     for key in ("esp32-c3", "esp32-c6", "esp32-c2", "esp32-s3"):
         if key in low:
-            return key.replace("-", ""), out
-    return None, out
+            return key.replace("-", "")
+    return None
+
+
+def _mac_in(out):
+    """The board's MAC from esptool's output: its BASE MAC where a chip also prints
+    a longer EUI-64 (the lookahead skips that line rather than cutting it short)."""
+    m = re.findall(r"MAC:\s*((?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2})(?![:-][0-9a-fA-F])", out)
+    return m[0].replace("-", ":").lower() if m else None
+
+
+def detect_chip(port):
+    rc, out = run_esptool(["--port", port, "flash_id"], timeout=40)
+    return _chip_in(out), out
 
 
 def read_mac(port):
     rc, out = run_esptool(["--port", port, "read_mac"], timeout=60)
     m = re.findall(r"MAC:\s*((?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2})", out)
     return (m[0].replace("-", ":").lower() if rc == 0 and m else None), out
+
+
+# ---- what is already on the board --------------------------------------------
+# Ropener (VAL3100), Generic board (VAL3100) and Glasscalibur are all ESP32-C6, so
+# chip detection cannot tell their boards apart. Every ESP-IDF app carries its
+# project name in its app descriptor ("ropener", "glasscalibur", "val3100", ...),
+# so the name read off the board, set against the names in the images cached
+# here, says when a board is about to get another product's firmware.
+PART_TABLE_OFFSET = 0x8000
+APP_DESC_MAGIC = 0xABCD5432
+BOARD_READ_SPAN = 0x10000 + 0x100 - PART_TABLE_OFFSET   # partition table .. a 0x10000 app's descriptor
+
+
+def _app_offsets(table):
+    """Offsets of the app partitions in a partition table, lowest first."""
+    out = []
+    for i in range(0, len(table) - 31, 32):
+        e = table[i:i + 32]
+        if e[:2] != b"\xaa\x50":
+            break
+        if e[2] == 0:
+            out.append(int.from_bytes(e[4:8], "little"))
+    return sorted(out)
+
+
+def _project_name(head):
+    """The project name in the app descriptor at the start of an app image
+    (24-byte image header + 8-byte segment header, then the descriptor), or None."""
+    if len(head) < 112 or head[0] != 0xE9 or int.from_bytes(head[32:36], "little") != APP_DESC_MAGIC:
+        return None
+    return head[80:112].split(b"\0")[0].decode("ascii", "replace").strip() or None
+
+
+def image_project(path):
+    """The project name inside a factory image on disk, or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(PART_TABLE_OFFSET)
+            apps = _app_offsets(f.read(0xC00))
+            if not apps:
+                return None
+            f.seek(apps[0])
+            return _project_name(f.read(0x100))
+    except OSError:
+        return None
+
+
+def inspect_board(port):
+    """(chip, project, mac, raw) for the board on `port`, from one esptool session
+    that reads the partition table and the start of the first app. project is
+    None for a blank board, or one whose firmware carries no app descriptor."""
+    with tempfile.TemporaryDirectory() as td:
+        head_path = os.path.join(td, "head.bin")
+
+        def read(off, size):
+            rc, out = run_esptool(["--port", port, "--baud", FLASH_BAUD, "read_flash",
+                                   hex(off), hex(size), head_path], timeout=60)
+            data = None
+            if rc == 0 and os.path.exists(head_path):
+                with open(head_path, "rb") as f:
+                    data = f.read()
+            return data, out
+
+        head, raw = read(PART_TABLE_OFFSET, BOARD_READ_SPAN)
+        chip, mac, project = _chip_in(raw), _mac_in(raw), None
+        apps = _app_offsets(head[:0xC00]) if head else []
+        if apps:
+            rel = apps[0] - PART_TABLE_OFFSET
+            if 0 <= rel and rel + 0x100 <= len(head):
+                project = _project_name(head[rel:rel + 0x100])
+            else:
+                app_head, more = read(apps[0], 0x100)
+                raw += more
+                project = _project_name(app_head or b"")
+    if not chip:
+        chip, more = detect_chip(port)
+        raw += more
+        mac = mac or _mac_in(more)
+    return chip, project, mac, raw
+
+
+def known_firmware(products, chip):
+    """{project name: [products]} from every chip-select product's cached image for `chip`."""
+    out = {}
+    for name, pcfg in products.items():
+        if is_variant(pcfg) or chip not in expected_chips(pcfg):
+            continue
+        proj = image_project(bin_path(name, chip))
+        if proj:
+            out.setdefault(proj, []).append(name)
+    return out
+
+
+def firmware_mismatch(products, product, chip, found):
+    """(other products, one line) when the board's firmware `found` is another
+    product's, else None. A name no cached image carries (blank, an older build,
+    something else entirely) is not a mismatch: there is nothing to compare it with."""
+    owners = known_firmware(products, chip).get(found, []) if found else []
+    if not owners or product in owners:
+        return None
+    other = " / ".join(owners)
+    return owners, f"this board is running {other} firmware, but {product} is selected"
 
 
 def flash(port, chip, binpath):
@@ -620,6 +889,91 @@ def flash_variant(port, product, vname, vcfg, factory_reset, log):
         return False, "flash FAILED — reseat & retry\n" + out.strip()[-600:]
     return True, ("flashed; settings ERASED (factory reset)" if factory_reset
                   else "flashed; settings kept (NVS untouched)")
+
+
+def variant_version(product, vname, vcfg):
+    vdir, local = variant_source(product, vname, vcfg)
+    if local:
+        return "local build"
+    try:
+        with open(os.path.join(vdir, ".release_tag")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# ---- the flash record --------------------------------------------------------
+# One row for every board the flasher tried: when, which firmware and version, the
+# board's MAC, what it was running before, and how it went. Kept next to the
+# script, where it is easy to find and opens in any spreadsheet. (Bench mode keeps
+# its own record, provisioned.csv.)
+FLASH_LOG = os.environ.get("VALAR_FLASHER_FLASH_LOG") or os.path.join(HERE, "flash-log.csv")
+FLASH_LOG_FIELDS = ["time", "product", "variant", "version", "chip", "port", "mac", "was", "result", "detail"]
+_flash_log_lock = threading.Lock()
+
+
+def record_flash(**row):
+    """Append one row. Returns None, or one line saying why it could not: a record
+    that cannot be written never stops the flashing (Excel locks a CSV it has open)."""
+    row = {k: " ".join(str(row.get(k) or "").split())[:200] for k in FLASH_LOG_FIELDS}
+    row["time"] = row["time"] or time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _flash_log_lock:
+            new = not os.path.exists(FLASH_LOG) or os.path.getsize(FLASH_LOG) == 0
+            # utf-8-sig: Excel reads the dashes in the details as text, not mojibake.
+            with open(FLASH_LOG, "a", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=FLASH_LOG_FIELDS)
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+        return None
+    except OSError as e:
+        return (f"Couldn't add this board to {os.path.basename(FLASH_LOG)} ({e.strerror or e}) "
+                f"-- is it open in Excel?")
+
+
+def open_file(path):
+    if sys.platform.startswith("win"):
+        os.startfile(path)
+    else:
+        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+
+# ---- sounds ------------------------------------------------------------------
+# DONE and FAILED sound different, so a pile can be worked without watching the
+# screen. Built-in OS sounds only; nothing to install.
+MAC_SOUNDS = {True: "/System/Library/Sounds/Glass.aiff", False: "/System/Library/Sounds/Basso.aiff"}
+LINUX_SOUNDS = {True: "/usr/share/sounds/freedesktop/stereo/complete.oga",
+                False: "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"}
+WIN_TONES = {True: [(880, 120), (1320, 180)], False: [(330, 300), (220, 450)]}   # (Hz, ms)
+
+
+def play_sound(ok, fallback=None):
+    """Never blocks and never raises; `fallback` runs when this OS has no way to play one."""
+    try:
+        if sys.platform.startswith("win"):
+            import winsound
+
+            def beep():
+                try:
+                    for hz, ms in WIN_TONES[ok]:
+                        winsound.Beep(hz, ms)
+                except RuntimeError:
+                    pass
+            threading.Thread(target=beep, daemon=True).start()
+            return
+        if sys.platform == "darwin":
+            cmd = ["afplay", MAC_SOUNDS[ok]]
+        else:
+            player = shutil.which("paplay") or shutil.which("pw-play")
+            cmd = [player, LINUX_SOUNDS[ok]] if player else None
+        if cmd and shutil.which(cmd[0]) and os.path.exists(cmd[1]):
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+    except Exception:
+        pass
+    if fallback:
+        fallback()
 
 
 # ---- bench mode (provisioning) ---------------------------------------------
@@ -858,11 +1212,11 @@ def run_gui(cfg):
     from tkinter import scrolledtext
 
     products = cfg["products"]
-    default_product = cfg.get("default") or next(iter(products))
+    default_product = starting_product(cfg)
 
     root = tk.Tk()
     root.title("Valar Flasher")
-    root.geometry("640x640")
+    root.geometry("640x680")
     root.configure(bg="#111418")
 
     q = queue.Queue()
@@ -870,16 +1224,27 @@ def run_gui(cfg):
     # window opens is not written until the operator flips the switch.
     state = {"busy": False, "auto": False, "force": "Auto",
              "product": default_product, "handled": {}, "variant": None,
-             "bench": None, "bench_stop": None}
+             "bench": None, "bench_stop": None,
+             "sound": load_settings().get("sound", True), "update": None}
 
     def log(m): q.put(("log", m))
     def set_status(m, c): q.put(("status", (m, c)))
     def set_version(t): q.put(("version", t))
 
-    # The chosen variant, in LARGE type, for as long as it is chosen: every
-    # Blipscope SKU is the same chip, so this label is the only thing standing
-    # between the operator and a board flashed with the wrong SKU's image.
-    variant_banner = tk.Label(root, text="", font=("Helvetica", 22, "bold"),
+    # Shown only once a newer flasher is found on GitHub (see app_update_check).
+    update_bar = tk.Frame(root, bg="#3d2f00")
+    update_lbl = tk.Label(update_bar, text="A newer version of Valar Flasher is available.",
+                          font=("Helvetica", 11, "bold"), bg="#3d2f00", fg="#ffd866",
+                          wraplength=470, justify="left")
+    update_lbl.pack(side="left", padx=10, pady=6)
+    update_btn = tk.Button(update_bar, text="Update app")
+    update_btn.pack(side="right", padx=10, pady=6)
+
+    # The chosen firmware (and variant), in LARGE type, for as long as it is
+    # chosen: Ropener, Generic board and Glasscalibur boards share a chip, as do
+    # all the Blipscope SKUs, so this label is what stands between the operator
+    # and a board flashed with the wrong product's image.
+    product_banner = tk.Label(root, text="", font=("Helvetica", 22, "bold"),
                               bg="#111418", fg="#58a6ff", pady=4)
     local_banner = tk.Label(root, text="", font=("Helvetica", 11, "bold"), wraplength=600,
                             bg="#5a1d1d", fg="#ffffff", pady=4)
@@ -961,7 +1326,16 @@ def run_gui(cfg):
     force_var = tk.StringVar(value="Auto")
     force_lbl = tk.Label(controls, text="  Force:", bg="#111418", fg="#9aa0a6")
     force_menu = tk.OptionMenu(controls, force_var, "Auto", "VAL3000", "VAL3100")
-    force_lbl.pack(side="left"); force_menu.pack(side="left")
+    sound_var = tk.BooleanVar(value=state["sound"])
+
+    def on_sound():
+        state["sound"] = sound_var.get()
+        save_settings(sound=state["sound"])
+    sound_box = tk.Checkbutton(controls, text="Sound", variable=sound_var, command=on_sound,
+                               bg="#111418", fg="#c9d1d9", selectcolor="#111418",
+                               activebackground="#111418", activeforeground="#c9d1d9")
+    sound_box.pack(side="left", padx=(12, 0))
+    force_lbl.pack(side="left", before=sound_box); force_menu.pack(side="left", before=sound_box)
 
     counts = {"n": 0}
 
@@ -993,16 +1367,16 @@ def run_gui(cfg):
         variant = is_variant(pcfg())
         for w in variant_menu_holder.winfo_children():
             w.destroy()
-        for w in (variant_banner, local_banner, reset_box, bench_box, count_entry, tiles_frame):
+        for w in (product_banner, local_banner, reset_box, bench_box, count_entry, tiles_frame):
             w.pack_forget()
+        product_banner.pack(fill="x", before=status)
         if variant:
             names = list((pcfg().get("variants") or {}).keys())
             if state["variant"] not in names:
-                state["variant"] = pcfg().get("default_variant") or names[0]
+                state["variant"] = starting_variant(state["product"], pcfg())
             variant_var.set(state["variant"])
             tk.OptionMenu(variant_menu_holder, variant_var, *names).pack(side="left", padx=6)
-            variant_banner.config(text=f"{state['product'].upper()} · {state['variant']}")
-            variant_banner.pack(fill="x", before=status)
+            product_banner.config(text=f"{state['product'].upper()} · {state['variant']}")
             if vcfg().get("local_build"):
                 local_banner.config(text=LOCAL_BUILD_WARNING)
                 local_banner.pack(fill="x", before=status)
@@ -1013,76 +1387,106 @@ def run_gui(cfg):
             force_lbl.pack_forget(); force_menu.pack_forget()
         else:
             state["variant"] = None
-            force_lbl.pack(side="left"); force_menu.pack(side="left")
+            product_banner.config(text=state["product"].upper())
+            force_lbl.pack(side="left", before=sound_box); force_menu.pack(side="left", before=sound_box)
             bench_var.set(False)
+
+    def ask(title, text):
+        """A yes/no question asked on the Tk thread; flashing runs on a worker, which waits."""
+        box = {"answered": threading.Event(), "yes": False}
+        q.put(("ask", (title, text, box)))
+        box["answered"].wait()
+        return box["yes"]
 
     def do_one_flash(port):
         state["busy"] = True
-        p = state["product"]
+        p, v = state["product"], state["variant"]
+        rec = {"product": p, "variant": v, "port": port}
+
+        def finish(result, status_text, log_text, detail):
+            """Every outcome ends here: the status line, the log, the flash record, the sound."""
+            ok = result == "DONE"
+            if ok:
+                counts["n"] += 1; q.put(("count", counts["n"]))
+            set_status(status_text, "#3fb950" if ok else "#e8c15a" if result == "SKIPPED" else "#e5534b")
+            log(log_text)
+            note = record_flash(result=result, detail=detail, **rec)
+            if note:
+                log(note)
+            if state["sound"] and result != "SKIPPED":
+                play_sound(ok, fallback=lambda: q.put(("bell", 1 if ok else 2)))
+            state["handled"][port] = "ok" if ok else "err"
+            state["busy"] = False
+
         if is_variant(pcfg()):
-            v = state["variant"]
             set_status(f"Flashing {v}…  (don't unplug)", "#e8c15a")
             log(f"[{port}] → {p} · {v} ({'FACTORY RESET' if reset_var.get() else 'settings kept'})")
+            rec.update(version=variant_version(p, v, vcfg()), mac=usb_mac(port))
             t0 = time.time()
             ok, msg = flash_variant(port, p, v, vcfg(), reset_var.get(), log)
             if ok:
-                counts["n"] += 1; q.put(("count", counts["n"]))
-                set_status(f"✓ {v} DONE — unplug & next", "#3fb950")
-                log(f"[{port}] {msg} in {time.time() - t0:.0f}s.\n")
-                state["handled"][port] = "ok"
-            else:
-                set_status("✗ " + msg.splitlines()[0][:60], "#e5534b")
-                log(f"[{port}] {msg}\n")
-                state["handled"][port] = "err"
-            state["busy"] = False
-            return
+                return finish("DONE", f"✓ {v} DONE — unplug & next",
+                              f"[{port}] {msg} in {time.time() - t0:.0f}s.\n", msg)
+            first = msg.splitlines()[0]
+            return finish("REFUSED" if first.startswith(("REFUSED", "PROTECTED")) else "FAILED",
+                          "✗ " + first[:60], f"[{port}] {msg}\n", first)
         try:
             prot = protected_reason(port)
         except ProtectedListError as e:
             prot = f"REFUSED -- {e}"
         if prot:
-            set_status("✗ PROTECTED board — refused", "#e5534b")
-            log(f"[{port}] {prot}")
-            state["busy"] = False; state["handled"][port] = "err"; return
+            return finish("REFUSED", "✗ PROTECTED board — refused", f"[{port}] {prot}", prot)
+        rec["version"] = cached_tag(p)
         set_status(f"Detecting {os.path.basename(port)}…", "#e8c15a")
-        chip, raw = detect_chip(port)
+        chip, found, mac, raw = inspect_board(port)
+        rec.update(chip=CHIP_LABEL.get(chip, chip), mac=mac, was=found)
         if not chip:
-            set_status("Couldn't identify the chip", "#e5534b")
-            log(f"[{port}] chip not recognized:\n{raw.strip()[-400:]}")
-            state["busy"] = False; state["handled"][port] = "err"; return
+            return finish("FAILED", "Couldn't identify the chip",
+                          f"[{port}] chip not recognized:\n{raw.strip()[-400:]}", "chip not recognized")
         forced = state["force"]
         chip_eff = ("esp32c3" if forced == "VAL3000" else
                     "esp32c6" if forced == "VAL3100" else chip)
         binp = bin_path(p, chip_eff)
         clabel = CHIP_LABEL.get(chip_eff, chip_eff)
         if chip_eff not in expected_chips(pcfg()):
-            set_status(f"{p} has no {clabel} firmware", "#e5534b")
-            log(f"[{port}] {p} defines no firmware for {clabel}. Pick another firmware or board.")
-            state["busy"] = False; state["handled"][port] = "err"; return
+            return finish("FAILED", f"{p} has no {clabel} firmware",
+                          f"[{port}] {p} defines no firmware for {clabel}. Pick another firmware or board.",
+                          f"{p} has no {clabel} firmware")
         if not os.path.exists(binp):
-            set_status(f"Missing {p} {clabel} bin", "#e5534b")
-            log(f"[{port}] need {p}/{chip_eff}.factory.bin — click 'Update firmware'.")
-            state["busy"] = False; state["handled"][port] = "err"; return
+            return finish("FAILED", f"Missing {p} {clabel} bin",
+                          f"[{port}] need {p}/{chip_eff}.factory.bin — click 'Update firmware'.",
+                          f"missing {p}/{chip_eff}.factory.bin")
+        if found:
+            log(f"[{port}] this board is currently running '{found}' firmware")
+        clash = firmware_mismatch(products, p, chip, found)
+        if clash:
+            owners, line = clash
+            other = " / ".join(owners)
+            log(f"[{port}] WARNING: {line}.")
+            set_status(f"This board has {other} firmware — waiting for you", "#e8c15a")
+            if not ask("Different firmware on this board",
+                       f"This board is running {other.upper()} firmware.\n\n"
+                       f"{p.upper()} is selected, so flashing would replace it with {p}.\n\n"
+                       f"Flash it with {p} anyway?"):
+                return finish("SKIPPED", f"Skipped — this board has {other} firmware",
+                              f"[{port}] not flashed: {line}. Unplug it, or pick {other} and click Flash now.\n",
+                              line)
+            log(f"[{port}] replacing its {other} firmware with {p}, as confirmed.")
         ok, why, _ = scan_gate(binp, pcfg().get("anchor", DEFAULT_ANCHOR), public_lists(p))
         if not ok:
-            set_status("✗ REFUSED — secret scan", "#e5534b")
-            log(f"[{port}] REFUSED {p}/{chip_eff}.factory.bin — {why}. Nothing was written.")
-            state["busy"] = False; state["handled"][port] = "err"; return
+            return finish("REFUSED", "✗ REFUSED — secret scan",
+                          f"[{port}] REFUSED {p}/{chip_eff}.factory.bin — {why}. Nothing was written.", why)
         log(f"[{port}] {clabel} → {p} firmware, flashing …")
         set_status(f"Flashing {p} · {clabel}…  (don't unplug)", "#e8c15a")
         t0 = time.time()
         rc, out = flash(port, chip_eff, binp)
         dt = time.time() - t0
+        rec["mac"] = rec["mac"] or _mac_in(out)
         if rc == 0:
-            counts["n"] += 1; q.put(("count", counts["n"]))
-            set_status(f"✓ {p} · {clabel} DONE — unplug & next", "#3fb950")
-            log(f"[{port}] flashed in {dt:.0f}s.\n")
-            state["handled"][port] = "ok"
-        else:
-            set_status(f"✗ FAILED — reseat & retry", "#e5534b")
-            log(f"[{port}] FAILED:\n{out.strip()[-600:]}\n")
-            state["handled"][port] = "err"
-        state["busy"] = False
+            return finish("DONE", f"✓ {p} · {clabel} DONE — unplug & next",
+                          f"[{port}] flashed in {dt:.0f}s.\n", f"flashed in {dt:.0f}s")
+        return finish("FAILED", "✗ FAILED — reseat & retry", f"[{port}] FAILED:\n{out.strip()[-600:]}\n",
+                      (out.strip().splitlines() or ["esptool failed"])[-1])
 
     def worker():
         while True:
@@ -1116,8 +1520,30 @@ def run_gui(cfg):
             refresh_version()
         threading.Thread(target=go, daemon=True).start()
 
+    def open_flash_log():
+        if not os.path.exists(FLASH_LOG):
+            log(f"No boards recorded yet — {os.path.basename(FLASH_LOG)} is created with the first one.")
+            return
+        try:
+            open_file(FLASH_LOG)
+        except Exception as e:
+            log(f"Couldn't open {FLASH_LOG}: {e}")
+
+    def update_app():
+        if state["busy"] or state["bench"]:
+            log("Finish flashing (and stop bench mode) before updating the app.")
+            return
+        update_btn.config(state="disabled", text="Updating…")
+        log("Updating Valar Flasher…")
+
+        def go():
+            q.put(("updated", app_update_apply(state["update"], log)))
+        threading.Thread(target=go, daemon=True).start()
+    update_btn.config(command=update_app)
+
     tk.Button(controls, text="Flash now", command=manual_flash).pack(side="right")
     tk.Button(controls, text="Update firmware", command=lambda: sync_selected(True)).pack(side="right", padx=6)
+    tk.Button(controls, text="Flash log", command=open_flash_log).pack(side="right")
 
     def render_tiles():
         s = state["bench"]
@@ -1190,6 +1616,7 @@ def run_gui(cfg):
         state["product"] = product_var.get()
         state["handled"].clear()
         refresh_layout()
+        save_settings(product=state["product"])
         log(f"— firmware set to {state['product']}"
             + (f" · {state['variant']}" if state["variant"] else "") + " —")
         sync_selected(False)
@@ -1200,6 +1627,7 @@ def run_gui(cfg):
             state["variant"] = variant_var.get()
             state["handled"].clear()
             refresh_layout()
+            save_settings(variants={state["product"]: state["variant"]})
             log(f"— variant set to {state['variant']} —")
             sync_selected(False)
     variant_var.trace_add("write", on_variant)
@@ -1222,6 +1650,26 @@ def run_gui(cfg):
                     version.config(text=payload)
                 elif kind == "tiles":
                     render_tiles()
+                elif kind == "ask":
+                    from tkinter import messagebox
+                    title, text, box = payload
+                    box["yes"] = messagebox.askyesno(title, text, icon="warning", default="no", parent=root)
+                    box["answered"].set()
+                elif kind == "bell":
+                    for i in range(payload):
+                        root.after(300 * i, root.bell)
+                elif kind == "update":
+                    state["update"] = payload
+                    update_bar.pack(fill="x", before=product_banner)
+                elif kind == "updated":
+                    ok, msg = payload
+                    log(msg)
+                    if ok:
+                        update_lbl.config(text="Updated. Close and reopen Valar Flasher to use the new version.")
+                        update_btn.config(state="normal", text="Close now", command=root.destroy)
+                    else:
+                        update_lbl.config(text="The update didn't install — see the log. Nothing was changed.")
+                        update_btn.config(state="normal", text="Try again")
         except queue.Empty:
             pass
         root.after(120, pump)
@@ -1236,6 +1684,11 @@ def run_gui(cfg):
         log("Ready. Plug in a board." if state["auto"] else
             "Ready. Auto-flash is OFF — switch it on (top right) to flash boards as "
             "they're plugged in, or click Flash now.")
+        changed = app_update_check(log)
+        if changed:
+            log(f"A newer version of Valar Flasher is available ({len(changed)} file(s) changed) "
+                f"— click Update app at the top.")
+            q.put(("update", changed))
     refresh_layout()
     threading.Thread(target=startup, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
@@ -1267,11 +1720,26 @@ def bench_targets():
 
 def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_reset=False):
     products = cfg["products"]
-    product = product or cfg.get("default") or next(iter(products))
+    # The last firmware picked in the window applies only when the command names
+    # none: a command that names a product flashes exactly what it says.
+    implicit = product is None
+    product = product or starting_product(cfg)
     pcfg = products[product]
+    sound = load_settings().get("sound", True)
+
+    def finish(result, line, **rec):
+        """Every board ends here: the line, the flash record, the sound."""
+        print(line)
+        note = record_flash(result=result, **rec)
+        if note:
+            print(note)
+        if sound and result != "SKIPPED":
+            play_sound(result == "DONE", fallback=lambda: print("\a", end="", flush=True))
+
     if is_variant(pcfg):
         names = list((pcfg.get("variants") or {}).keys())
-        variant = variant or pcfg.get("default_variant") or names[0]
+        variant = variant or (starting_variant(product, pcfg) if implicit
+                              else pcfg.get("default_variant") or names[0])
         vcfg = pcfg["variants"][variant]
         print(f"Valar Flasher (console mode).\n\n    >>> {product.upper()} · {variant} <<<\n")
         if vcfg.get("local_build"):
@@ -1328,7 +1796,11 @@ def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_r
                     if p in handled:
                         continue
                     ok, msg = flash_variant(p, product, variant, vcfg, factory_reset, print)
-                    print(f"[{p}] {variant}: {'DONE (#%d) — ' % (n + 1) if ok else 'FAILED — '}{msg}\n")
+                    first = msg.splitlines()[0]
+                    finish("DONE" if ok else "REFUSED" if first.startswith(("REFUSED", "PROTECTED")) else "FAILED",
+                           f"[{p}] {variant}: {'DONE (#%d) — ' % (n + 1) if ok else 'FAILED — '}{msg}\n",
+                           product=product, variant=variant, version=variant_version(product, variant, vcfg),
+                           port=p, mac=usb_mac(p), detail=first)
                     n += ok
                     handled[p] = 1
                 time.sleep(0.8)
@@ -1338,6 +1810,38 @@ def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_r
     print(f"Valar Flasher (console mode). Firmware source: {product}")
     sync_firmware(product, pcfg, print)
     print("Plug in boards one at a time. Ctrl-C to quit.\n")
+
+    def flash_one(p, rec):
+        """(result, line, detail) for one board, filling `rec` as it learns."""
+        try:
+            prot = protected_reason(p)
+        except ProtectedListError as e:
+            prot = f"REFUSED -- {e}"
+        if prot:
+            return "REFUSED", f"[{p}] {prot}", prot
+        chip, found, mac, raw = inspect_board(p)
+        rec.update(chip=CHIP_LABEL.get(chip, chip), mac=mac, was=found)
+        if not chip:
+            return "FAILED", f"[{p}] chip not recognized", "chip not recognized"
+        binp = bin_path(product, chip)
+        if not os.path.exists(binp):
+            return "FAILED", f"[{p}] {product}: missing {chip}.factory.bin", f"missing {chip}.factory.bin"
+        clash = firmware_mismatch(products, product, chip, found)
+        if clash:
+            owners, line = clash
+            print(f"[{p}] WARNING: {line}.")
+            if input(f"Replace it with {product}? Type yes to flash it: ").strip().lower() != "yes":
+                return "SKIPPED", f"[{p}] not flashed: {line}.\n", line
+        ok, why, _ = scan_gate(binp, pcfg.get("anchor", DEFAULT_ANCHOR), public_lists(product))
+        if not ok:
+            return "REFUSED", f"[{p}] REFUSED {chip}.factory.bin — {why}. Nothing was written.", why
+        print(f"[{p}] {CHIP_LABEL.get(chip, chip)} -> {product}: flashing …")
+        rc, out = flash(p, chip, binp)
+        rec["mac"] = rec["mac"] or _mac_in(out)
+        if rc == 0:
+            return "DONE", None, "flashed"
+        return "FAILED", f"[{p}] FAILED:\n{out.strip()[-500:]}\n", (out.strip().splitlines() or ["esptool failed"])[-1]
+
     handled, n = {}, 0
     try:
         while True:
@@ -1348,27 +1852,12 @@ def run_console(cfg, product=None, variant=None, bench=False, count=0, factory_r
             for p in present:
                 if p in handled:
                     continue
-                try:
-                    prot = protected_reason(p)
-                except ProtectedListError as e:
-                    prot = f"REFUSED -- {e}"
-                if prot:
-                    print(f"[{p}] {prot}"); handled[p] = 1; continue
-                chip, raw = detect_chip(p)
-                if not chip:
-                    print(f"[{p}] chip not recognized"); handled[p] = 1; continue
-                binp = bin_path(product, chip)
-                if not os.path.exists(binp):
-                    print(f"[{p}] {product}: missing {chip}.factory.bin"); handled[p] = 1; continue
-                ok, why, _ = scan_gate(binp, pcfg.get("anchor", DEFAULT_ANCHOR), public_lists(product))
-                if not ok:
-                    print(f"[{p}] REFUSED {chip}.factory.bin — {why}. Nothing was written."); handled[p] = 1; continue
-                print(f"[{p}] {CHIP_LABEL.get(chip, chip)} -> {product}: flashing …")
-                rc, out = flash(p, chip, binp)
-                print(f"[{p}] DONE (#{n+1}) — unplug & next\n" if rc == 0
-                      else f"[{p}] FAILED:\n{out.strip()[-500:]}\n")
-                if rc == 0:
+                rec = {"product": product, "version": cached_tag(product), "port": p}
+                result, line, detail = flash_one(p, rec)
+                if result == "DONE":
                     n += 1
+                    line = f"[{p}] DONE (#{n}) — unplug & next\n"
+                finish(result, line, detail=detail, **rec)
                 handled[p] = 1
             time.sleep(0.8)
     except KeyboardInterrupt:
