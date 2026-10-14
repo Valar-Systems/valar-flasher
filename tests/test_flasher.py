@@ -4,6 +4,7 @@ the provisioner is tests/fake_provisioner.py.
 
     python -m unittest discover -s tests -v
 """
+import csv
 import hashlib
 import json
 import re
@@ -568,6 +569,343 @@ class ReleaseChecks(Rig):
         self.assertEqual(vf.bench_board("COMX", s), "FAILED")
         self.assertIn("never a local build", s.tiles["00:00:00:00:00:01"]["detail"])
         self.assertEqual(self.writes(), [])
+
+
+def esp_image(project, app_off=0x10000):
+    """A minimal ESP-IDF factory image: partition table at 0x8000 (nvs, app0, app1)
+    and an app whose descriptor names `project`. Carries the scan's anchor."""
+    def entry(kind, sub, off, size, name):
+        return (b"\xaa\x50" + bytes([kind, sub]) + off.to_bytes(4, "little") + size.to_bytes(4, "little")
+                + name.ljust(16, b"\0") + b"\0" * 4)
+    img = bytearray(b"\xff" * (app_off + 0x200))
+    img[0:12] = b"\xe9\0esp_image\0"
+    table = (entry(1, 2, 0x9000, 0x5000, b"nvs") + entry(0, 0x10, app_off, 0x1C0000, b"app0")
+             + entry(0, 0x11, app_off + 0x1C0000, 0x1C0000, b"app1"))
+    img[0x8000:0x8000 + len(table)] = table
+    head = bytearray(0x100)
+    head[0] = 0xE9
+    head[32:36] = vf.APP_DESC_MAGIC.to_bytes(4, "little")
+    head[48:56] = b"2026.6.5"
+    head[80:80 + len(project)] = project
+    img[app_off:app_off + 0x100] = head
+    return bytes(img)
+
+
+class FeatureRig(Rig):
+    """Rig, plus this machine's settings and flash record kept out of the way."""
+
+    def setUp(self):
+        super().setUp()
+        self.fsaved = (vf.SETTINGS_FILE, vf.FLASH_LOG, vf.play_sound, vf.list_ports, vf.get_latest)
+        vf.SETTINGS_FILE = os.path.join(self.td, "settings.json")
+        vf.FLASH_LOG = os.path.join(self.td, "flash-log.csv")
+        self.sounds = []
+        vf.play_sound = lambda ok, fallback=None: self.sounds.append(ok)
+        vf.get_latest = lambda repo, log: None            # offline: flash what is cached
+        os.environ.pop("FAKE_FLASH", None)
+        self.products = {
+            "Ropener": {"repo": "x/ropener", "assets": {"esp32c3": "val3000", "esp32c6": "val3100"}},
+            "Glasscalibur": {"repo": "x/glass", "assets": {"esp32c6": "glasscalibur"}},
+        }
+        for product, chip, name in (("Ropener", "esp32c6", b"ropener"), ("Ropener", "esp32c3", b"ropener"),
+                                    ("Glasscalibur", "esp32c6", b"glasscalibur")):
+            os.makedirs(vf.fw_dir(product), exist_ok=True)
+            with open(vf.bin_path(product, chip), "wb") as f:
+                f.write(esp_image(name))
+
+    def tearDown(self):
+        (vf.SETTINGS_FILE, vf.FLASH_LOG, vf.play_sound, vf.list_ports, vf.get_latest) = self.fsaved
+        os.environ.pop("FAKE_FLASH", None)
+        super().tearDown()
+
+    def board(self, project=None, app_off=0x10000):
+        """The next board's flash: `project`'s firmware, or blank."""
+        if project is None:
+            os.environ.pop("FAKE_FLASH", None)
+            return
+        path = os.path.join(self.td, "board.bin")
+        with open(path, "wb") as f:
+            f.write(esp_image(project, app_off))
+        os.environ["FAKE_FLASH"] = path
+
+    def rows(self):
+        if not os.path.exists(vf.FLASH_LOG):
+            return []
+        with open(vf.FLASH_LOG, newline="", encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))
+
+
+class BoardFirmware(FeatureRig):
+    def test_the_project_name_is_read_from_a_factory_image(self):
+        self.assertEqual(vf.image_project(vf.bin_path("Glasscalibur", "esp32c6")), "glasscalibur")
+        other = os.path.join(self.td, "far.bin")
+        open(other, "wb").write(esp_image(b"val3100", app_off=0x20000))
+        self.assertEqual(vf.image_project(other), "val3100")
+        open(other, "wb").write(b"\xff" * 0x10000)
+        self.assertIsNone(vf.image_project(other), "a blank image names nothing")
+
+    def test_one_esptool_session_reads_chip_name_and_mac_and_writes_nothing(self):
+        os.environ.update(FAKE_CHIP="ESP32-C6", FAKE_MAC="40:4c:ca:57:2a:08")
+        self.board(b"glasscalibur")
+        chip, found, mac, _ = vf.inspect_board("COM9")
+        self.assertEqual((chip, found, mac), ("esp32c6", "glasscalibur", "40:4c:ca:57:2a:08"))
+        self.assertEqual([c["sub"] for c in self.calls()], ["read_flash"])
+        self.assertEqual(self.writes(), [])
+
+    def test_an_app_past_the_first_read_costs_one_more_read(self):
+        os.environ["FAKE_CHIP"] = "ESP32-C6"
+        self.board(b"val3100", app_off=0x20000)
+        self.assertEqual(vf.inspect_board("COM9")[1], "val3100")
+        self.assertEqual([c["sub"] for c in self.calls()], ["read_flash", "read_flash"])
+
+    def test_a_blank_board_has_a_chip_but_no_name(self):
+        os.environ["FAKE_CHIP"] = "ESP32-C6"
+        chip, found, _, _ = vf.inspect_board("COM9")
+        self.assertEqual((chip, found), ("esp32c6", None))
+
+    def test_another_products_firmware_is_a_mismatch_that_names_it(self):
+        owners, line = vf.firmware_mismatch(self.products, "Ropener", "esp32c6", "glasscalibur")
+        self.assertEqual(owners, ["Glasscalibur"])
+        self.assertIn("Glasscalibur", line)
+        self.assertIn("Ropener is selected", line)
+
+    def test_own_unknown_or_no_firmware_is_not_a_mismatch(self):
+        for found in ("ropener", "arduino-lib-builder", None):
+            self.assertIsNone(vf.firmware_mismatch(self.products, "Ropener", "esp32c6", found), found)
+
+    def test_the_base_mac_is_taken_over_a_longer_eui64(self):
+        out = "MAC: 40:4c:ca:ff:fe:57:2a:08\nBASE MAC: 40:4c:ca:57:2a:08\nMAC_EXT: ff:fe\n"
+        self.assertEqual(vf._mac_in(out), "40:4c:ca:57:2a:08")
+        self.assertEqual(vf._mac_in("MAC: 90:70:69:32:6E:64"), "90:70:69:32:6e:64")
+
+
+class ConsoleChipFlash(FeatureRig):
+    """The console flash loop end to end: one board on COM9, then Ctrl-C."""
+
+    def run_once(self, product, answer=None):
+        seen = []
+
+        def ports():
+            if seen:
+                raise KeyboardInterrupt
+            seen.append(1)
+            return ["COM9"]
+        vf.list_ports = ports
+        os.environ.setdefault("FAKE_CHIP", "ESP32-C6")
+        asked = []
+
+        def fake_input(prompt=""):
+            asked.append(prompt)
+            if answer is None:
+                raise AssertionError(f"asked when it should not have: {prompt}")
+            return answer
+        from unittest import mock
+        with mock.patch("builtins.input", fake_input):
+            vf.run_console({"products": self.products}, product)
+        return asked
+
+    def test_a_board_running_another_products_firmware_is_not_flashed_unless_confirmed(self):
+        self.board(b"glasscalibur")
+        asked = self.run_once("Ropener", answer="no")
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(self.writes(), [])
+        row, = self.rows()
+        self.assertEqual((row["result"], row["was"], row["product"]), ("SKIPPED", "glasscalibur", "Ropener"))
+        self.assertEqual(self.sounds, [], "an operator's 'no' is not a failure")
+
+    def test_CONTROL_yes_flashes_it(self):
+        self.board(b"glasscalibur")
+        self.run_once("Ropener", answer="yes")
+        self.assertEqual([w[2] for w in self.writes()], ["esp32c6.factory.bin"])
+        self.assertEqual(self.rows()[0]["result"], "DONE")
+        self.assertEqual(self.sounds, [True])
+
+    def test_a_blank_board_and_a_same_product_board_flash_without_asking(self):
+        for project in (None, b"ropener"):
+            self.board(project)
+            self.run_once("Ropener")
+        self.assertEqual(len(self.writes()), 2)
+        self.assertEqual([r["result"] for r in self.rows()], ["DONE", "DONE"])
+        self.assertEqual([r["was"] for r in self.rows()], ["", "ropener"])
+
+    def test_the_record_says_what_was_flashed_onto_which_board(self):
+        os.environ["FAKE_MAC"] = "40:4c:ca:57:2a:08"
+        with open(os.path.join(vf.fw_dir("Glasscalibur"), ".release_tag"), "w") as f:
+            f.write("v2.1.0")
+        self.run_once("Glasscalibur")
+        row, = self.rows()
+        self.assertEqual({k: row[k] for k in ("product", "version", "chip", "port", "mac", "result")},
+                         {"product": "Glasscalibur", "version": "v2.1.0", "chip": "ESP32-C6",
+                          "port": "COM9", "mac": "40:4c:ca:57:2a:08", "result": "DONE"})
+        self.assertRegex(row["time"], r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+
+    def test_a_failed_flash_is_recorded_and_sounds_different(self):
+        os.environ["FAKE_FAIL"] = "write_flash"
+        self.run_once("Ropener")
+        self.assertEqual(self.rows()[0]["result"], "FAILED")
+        self.assertEqual(self.sounds, [False])
+
+
+class FlashRecord(FeatureRig):
+    def test_rows_append_under_one_header(self):
+        vf.record_flash(product="Ropener", result="DONE", detail="flashed\nin 12s")
+        vf.record_flash(product="Glasscalibur", result="FAILED", detail="reseat — retry")
+        raw = open(vf.FLASH_LOG, "rb").read()
+        self.assertEqual(raw.count(b"\xef\xbb\xbf"), 1, "one BOM, at the start, for Excel")
+        rows = self.rows()
+        self.assertEqual([(r["product"], r["result"]) for r in rows], [("Ropener", "DONE"), ("Glasscalibur", "FAILED")])
+        self.assertEqual(rows[0]["detail"], "flashed in 12s", "one line per board")
+        self.assertEqual(rows[1]["detail"], "reseat — retry")
+
+    def test_a_record_that_cannot_be_written_never_stops_the_flashing(self):
+        vf.FLASH_LOG = self.td                    # a directory: opening it to append fails
+        note = vf.record_flash(product="Ropener", result="DONE")
+        self.assertIn("open in Excel", note)
+
+
+class Remembered(FeatureRig):
+    def test_the_last_firmware_and_variant_open_next_time(self):
+        cfg = {"default": "Ropener", "products": dict(self.products, Blipscope={"variants": {"A": {}, "B": {}}})}
+        self.assertEqual(vf.starting_product(cfg), "Ropener")
+        vf.save_settings(product="Glasscalibur")
+        vf.save_settings(variants={"Blipscope": "B"})
+        self.assertEqual(vf.starting_product(cfg), "Glasscalibur")
+        self.assertEqual(vf.starting_variant("Blipscope", cfg["products"]["Blipscope"]), "B")
+        self.assertEqual(vf.load_settings()["product"], "Glasscalibur", "saving one key keeps the others")
+
+    def test_a_product_that_is_gone_or_an_unreadable_file_means_the_default(self):
+        cfg = {"default": "Ropener", "products": self.products}
+        vf.save_settings(product="Discontinued")
+        self.assertEqual(vf.starting_product(cfg), "Ropener")
+        open(vf.SETTINGS_FILE, "w").write("{not json")
+        self.assertEqual(vf.load_settings(), {})
+        self.assertEqual(vf.starting_product(cfg), "Ropener")
+
+
+class AppUpdate(unittest.TestCase):
+    """The flasher updating itself from a fake GitHub: a tree, and the blobs it names."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+        self.app = os.path.join(self.td, "app")
+        os.makedirs(self.app)
+        self.saved = (vf.HERE, vf.UPDATE_BACKUP, vf._gh_json)
+        vf.HERE, vf.UPDATE_BACKUP = self.app, os.path.join(self.app, ".update-backup")
+        self.remote = {}                          # path -> (bytes, mode)
+        self.corrupt = set()
+
+        def gh_json(url, timeout=30):
+            if "/git/trees/" in url:
+                return {"truncated": False, "tree": [
+                    {"path": p, "type": "blob", "mode": m, "sha": vf._blob_sha(d)} for p, (d, m) in self.remote.items()]}
+            sha = url.rsplit("/", 1)[-1]
+            data = next(d for d, m in self.remote.values() if vf._blob_sha(d) == sha)
+            if sha in self.corrupt:
+                data += b"tampered"
+            return {"content": __import__("base64").b64encode(data).decode()}
+        vf._gh_json = gh_json
+
+    def tearDown(self):
+        vf.HERE, vf.UPDATE_BACKUP, vf._gh_json = self.saved
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def local(self, path, data):
+        full = os.path.join(self.app, *path.split("/"))
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, "wb").write(data)
+
+    def read(self, path):
+        return open(os.path.join(self.app, *path.split("/")), "rb").read()
+
+    def test_an_up_to_date_folder_has_nothing_to_update_even_with_windows_line_endings(self):
+        self.remote = {"valar_flasher.py": (b"print('v2')\n", "100644"),
+                       "Valar Flasher (Windows).bat": (b"@echo off\nstart\n", "100644")}
+        self.local("valar_flasher.py", b"print('v2')\n")
+        self.local("Valar Flasher (Windows).bat", b"@echo off\r\nstart\r\n")
+        self.assertEqual(vf.app_update_check(), [])
+
+    def test_changed_and_new_files_are_found_and_development_files_ignored(self):
+        self.remote = {"valar_flasher.py": (b"print('v2')\n", "100644"),
+                       "products.json": (b"{}\n", "100644"),
+                       "tools/new.py": (b"x = 1\n", "100644"),
+                       "tests/test_flasher.py": (b"changed\n", "100644"),
+                       ".github/workflows/test.yml": (b"changed\n", "100644")}
+        self.local("valar_flasher.py", b"print('v1')\n")
+        self.local("products.json", b"{}\n")
+        self.assertEqual(sorted(e["path"] for e in vf.app_update_check()), ["tools/new.py", "valar_flasher.py"])
+
+    def test_an_update_replaces_the_files_and_keeps_the_old_ones(self):
+        self.remote = {"valar_flasher.py": (b"print('v2')\n", "100644"),
+                       "Valar Flasher (Mac).command": (b"#!/bin/bash\necho v2\n", "100755"),
+                       "Valar Flasher (Windows).bat": (b"@echo off\nv2\n", "100644")}
+        self.local("valar_flasher.py", b"print('v1')\n")
+        self.local("products.local.json", b"{\"mine\": 1}\n")
+        ok, msg = vf.app_update_apply(vf.app_update_check())
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.read("valar_flasher.py"), b"print('v2')\n")
+        self.assertEqual(self.read("Valar Flasher (Windows).bat"), b"@echo off\r\nv2\r\n")
+        self.assertEqual(self.read("products.local.json"), b"{\"mine\": 1}\n", "local files are not the repo's")
+        if os.name == "posix":
+            self.assertTrue(os.access(os.path.join(self.app, "Valar Flasher (Mac).command"), os.X_OK))
+        backup, = os.listdir(vf.UPDATE_BACKUP)
+        self.assertEqual(open(os.path.join(vf.UPDATE_BACKUP, backup, "valar_flasher.py"), "rb").read(),
+                         b"print('v1')\n")
+        self.assertEqual(vf.app_update_check(), [], "and afterwards it is up to date")
+
+    def test_a_download_that_fails_its_hash_changes_nothing(self):
+        self.remote = {"valar_flasher.py": (b"print('v2')\n", "100644"), "README.md": (b"new\n", "100644")}
+        self.local("valar_flasher.py", b"print('v1')\n")
+        self.corrupt = {vf._blob_sha(b"new\n")}
+        ok, msg = vf.app_update_apply(vf.app_update_check())
+        self.assertFalse(ok)
+        self.assertIn("Nothing was changed", msg)
+        self.assertEqual(self.read("valar_flasher.py"), b"print('v1')\n")
+        self.assertFalse(os.path.exists(os.path.join(self.app, "README.md")))
+
+    def test_a_write_that_fails_halfway_puts_the_old_files_back(self):
+        self.remote = {"a.py": (b"a2\n", "100644"), "b.py": (b"b2\n", "100644")}
+        self.local("a.py", b"a1\n")
+        self.local("b.py", b"b1\n")
+        real_replace, calls = os.replace, []
+
+        def flaky_replace(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:
+                raise PermissionError(13, "Permission denied", dst)
+            real_replace(src, dst)
+        from unittest import mock
+        with mock.patch.object(vf.os, "replace", flaky_replace):
+            ok, msg = vf.app_update_apply(vf.app_update_check())
+        self.assertFalse(ok)
+        self.assertIn("put back", msg)
+        self.assertEqual((self.read("a.py"), self.read("b.py")), (b"a1\n", b"b1\n"))
+        self.assertEqual(sorted(n for n in os.listdir(self.app) if n.endswith(".new")), [])
+
+    def test_a_git_checkout_is_left_to_git(self):
+        os.makedirs(os.path.join(self.app, ".git"))
+        self.remote = {"valar_flasher.py": (b"print('v2')\n", "100644")}
+        self.assertIsNone(vf.app_update_check())
+
+
+class Sounds(unittest.TestCase):
+    def test_done_and_failed_play_different_mac_system_sounds(self):
+        from unittest import mock
+        started = []
+        with mock.patch.object(vf.sys, "platform", "darwin"), \
+                mock.patch.object(vf.shutil, "which", lambda c: "/usr/bin/" + c), \
+                mock.patch.object(vf.os.path, "exists", lambda p: True), \
+                mock.patch.object(vf.subprocess, "Popen", lambda cmd, **k: started.append(cmd)):
+            vf.play_sound(True)
+            vf.play_sound(False)
+        self.assertEqual([c[0] for c in started], ["afplay", "afplay"])
+        self.assertNotEqual(started[0][1], started[1][1])
+
+    def test_no_player_falls_back_and_never_raises(self):
+        from unittest import mock
+        fell_back = []
+        with mock.patch.object(vf.sys, "platform", "linux"), mock.patch.object(vf.shutil, "which", lambda c: None):
+            vf.play_sound(True, fallback=lambda: fell_back.append(1))
+        self.assertEqual(fell_back, [1])
 
 
 class Vendored(unittest.TestCase):

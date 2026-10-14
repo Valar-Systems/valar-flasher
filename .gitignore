@@ -17,3 +17,7 @@ products.local.json
 
 # The manufacturing record, when bench mode keeps it next to the script
 provisioned.csv
+
+# Every board flashed (see README "Flash log"), and the files the self-updater replaced
+flash-log.csv
+.update-backup/

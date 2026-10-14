@@ -70,6 +70,40 @@ the switch again to turn it off whenever you need to plug a board in without
 flashing it; **Flash now** still flashes the attached board on demand. A **red**
 line means reseat the cable and replug that one.
 
+- **The firmware you picked is shown in large type** at the top, and the window
+  opens on the firmware you used last time.
+- **Sounds:** one sound when a board is DONE, a different one when it FAILS, so
+  you can work a pile without watching the screen. Untick **Sound** to mute it.
+- **Flash log:** every board is added to `flash-log.csv` next to the script —
+  date and time, firmware and version, the board's MAC, what firmware it had
+  before, and whether it worked. Click **Flash log** to open it in your
+  spreadsheet app. (If it's open in Excel while you flash, that board can't be
+  added; the window says so and flashing carries on.)
+
+## Wrong-firmware check
+
+Ropener (VAL3100), Generic board (VAL3100) and Glasscalibur all use the **same
+ESP32-C6**, so the chip alone can't tell their boards apart. Before writing, the
+flasher reads the name of the firmware already on the board. If it is **another
+product's** firmware — say a Glasscalibur board while Ropener is selected — it
+stops and asks before replacing it (the default answer is **No**). Blank boards,
+boards already running the selected firmware, and firmware it doesn't recognise
+(an old build, say) flash without asking. It recognises the firmware of every
+product this computer has downloaded.
+
+## The flasher updates itself
+
+When the window opens it also checks GitHub for a newer version of the flasher.
+If there is one, a bar at the top says so: click **Update app**, then close and
+reopen the window. Your own files — `products.local.json`, `github_token.txt`,
+`provisioned.csv`, `flash-log.csv` and the downloaded firmware — are never
+touched, and every file it replaces is kept in `.update-backup/`. (A folder that
+is a git checkout is left to `git pull`.)
+
+An update replaces `products.json` with the one on GitHub. To add a product on
+just your computer, put it in `products.local.json` instead (same format, under
+`"products"`) — it is merged over `products.json` and updates never touch it.
+
 ## VAL3101 shares the VAL3100's chip
 
 The VAL3101 uses the **same ESP32-C6** as the VAL3100, so chip auto-detect can't
