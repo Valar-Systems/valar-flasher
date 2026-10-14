@@ -919,34 +919,48 @@ class ConnectedBoards(Rig):
         self.b = vf.BoardList()
 
     def test_boards_already_connected_are_ignored_and_new_ones_flash(self):
-        self.b.update([self.BLIP1, self.BLIP2], auto_on=False, details=self.DETAILS)      # window opens
+        self.b.update([self.BLIP1, self.BLIP2], details=self.DETAILS)            # window opens
         self.assertEqual(self.b.flashable([self.BLIP1, self.BLIP2]), [])
-        self.b.update([self.BLIP1, self.BLIP2, self.GLASS], auto_on=True, details=self.DETAILS)
+        self.b.update([self.BLIP1, self.BLIP2, self.GLASS], details=self.DETAILS)
         self.assertEqual(self.b.flashable([self.BLIP1, self.BLIP2, self.GLASS]), [self.GLASS])
 
-    def test_a_board_plugged_in_while_auto_flash_is_off_stays_ignored_when_it_goes_on(self):
-        self.b.update([self.GLASS], auto_on=False, details=self.DETAILS)
-        self.b.update([self.GLASS], auto_on=True, details=self.DETAILS)
-        self.assertEqual(self.b.flashable([self.GLASS]), [], "turning auto-flash on flashes nothing already there")
-        self.assertFalse(self.b.toggle(self.GLASS), "CONTROL: flipping its switch lets it be flashed")
-        self.assertEqual(self.b.flashable([self.GLASS]), [self.GLASS])
+    def test_a_board_plugged_in_after_opening_is_flashable_even_if_it_reconnects(self):
+        """The bench report, 2026-10-14: an ESP32 plugged in before auto-flash went on,
+        which dropped off USB and came back, sat IGNORED while auto-flash was on."""
+        d = {"COM18": ("USB Serial Device", "90:70:69:31:E2:08"), "COM6": ("USB Serial Device", None),
+             "COM42": ("USB Serial Device", "A0:F2:62:9E:5C:A4")}
+        self.b.update(["COM18", "COM6"], details=d)              # flasher opens
+        self.b.update(["COM18", "COM6", "COM42"], details=d)     # ESP32 plugged in, auto-flash still off
+        self.b.update(["COM18", "COM6"], details=d)              # it drops off USB...
+        self.b.update(["COM18", "COM6", "COM42"], details=d)     # ...and comes back
+        self.assertEqual(self.b.flashable(["COM18", "COM6", "COM42"]), ["COM42"])
 
     def test_an_ignored_board_stays_ignored_when_replugged_known_by_its_serial(self):
-        self.b.update([self.BLIP1], auto_on=False, details=self.DETAILS)
-        self.b.update([], auto_on=True, details=self.DETAILS)                  # unplugged...
-        self.b.update(["COM12"], auto_on=True,                                 # ...back, on another port
-                      details={"COM12": ("Blipscope", "90:70:69:32:6E:64")})
+        self.b.update([self.BLIP1], details=self.DETAILS)
+        self.b.update([], details=self.DETAILS)                                 # unplugged...
+        self.b.update(["COM12"], details={"COM12": ("Blipscope", "90:70:69:32:6E:64")})   # ...back, another port
         self.assertEqual(self.b.flashable(["COM12"]), [])
 
+    def test_a_board_switched_to_ignored_by_hand_stays_ignored_when_replugged(self):
+        self.b.update([], details=self.DETAILS)
+        self.b.update([self.GLASS], details=self.DETAILS)
+        self.assertTrue(self.b.toggle(self.GLASS))
+        self.b.update([], details=self.DETAILS)
+        self.b.update([self.GLASS], details=self.DETAILS)
+        self.assertEqual(self.b.flashable([self.GLASS]), [])
+        self.assertFalse(self.b.toggle(self.GLASS), "CONTROL: flipping it back lets it be flashed")
+        self.assertEqual(self.b.flashable([self.GLASS]), [self.GLASS])
+
     def test_a_board_with_no_serial_is_known_only_by_its_port(self):
-        self.b.update(["COM9"], auto_on=False, details=self.DETAILS)
-        self.b.update([], auto_on=True, details=self.DETAILS)
-        self.b.update(["COM9"], auto_on=True, details=self.DETAILS)
-        self.assertEqual(self.b.flashable(["COM9"]), ["COM9"], "replugged while auto-flash is on = a new board")
+        self.b.update(["COM9"], details=self.DETAILS)
+        self.b.update([], details=self.DETAILS)
+        self.b.update(["COM9"], details=self.DETAILS)
+        self.assertEqual(self.b.flashable(["COM9"]), ["COM9"], "replugged = a new board")
 
     def test_a_protected_board_is_ignored_and_cannot_be_switched_on(self):
         json.dump({"macs": {"40:4c:ca:57:2a:08": "bench unit"}}, open(vf.PROTECTED_FILE, "w"))
-        self.b.update([self.GLASS], auto_on=True, details=self.DETAILS)
+        self.b.update([], details=self.DETAILS)
+        self.b.update([self.GLASS], details=self.DETAILS)
         self.assertEqual(self.b.flashable([self.GLASS]), [])
         self.assertIsNone(self.b.toggle(self.GLASS))
         self.assertTrue(self.b.snapshot()[0][1]["protected"])

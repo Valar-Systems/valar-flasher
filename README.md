@@ -81,15 +81,15 @@ and replug that one.
 ## Other boards connected? They're left alone
 
 The **Connected boards** list shows every board plugged in, each with an
-**Ignore** switch. **Any board connected while auto-flash is off is ignored
-automatically** — whatever was plugged in when you opened the window, or before
-you switched auto-flash on. An ignored board is never touched: not flashed, not
-even reset to read its chip. Boards you plug in **after** turning auto-flash on
-are flashed.
+**Ignore** switch. **Boards that are already connected when you open the flasher
+are ignored automatically.** An ignored board is never touched: not flashed, not
+even reset to read its chip. **Any board you plug in after opening the flasher is
+flashed** as soon as auto-flash is on — whether you plugged it in before or after
+flipping the switch, and even if it drops off USB and comes back.
 
 So with two Blipscopes on the computer and a Glasscalibur to flash: open the
-window (both Blipscopes show *ignored*), turn auto-flash on, plug in the
-Glasscalibur — only it is flashed.
+flasher (both Blipscopes show *ignored*), plug in the Glasscalibur, turn
+auto-flash on — only the Glasscalibur is flashed.
 
 - Want an ignored board flashed after all? Flip its switch off; with auto-flash
   on it's flashed straight away, or click the **Flash** button on its row.
