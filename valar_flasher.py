@@ -866,7 +866,9 @@ def run_gui(cfg):
     root.configure(bg="#111418")
 
     q = queue.Queue()
-    state = {"busy": False, "auto": True, "force": "Auto",
+    # Auto-flash starts OFF on every launch: a board already plugged in when the
+    # window opens is not written until the operator flips the switch.
+    state = {"busy": False, "auto": False, "force": "Auto",
              "product": default_product, "handled": {}, "variant": None,
              "bench": None, "bench_stop": None}
 
@@ -881,7 +883,7 @@ def run_gui(cfg):
                               bg="#111418", fg="#58a6ff", pady=4)
     local_banner = tk.Label(root, text="", font=("Helvetica", 11, "bold"), wraplength=600,
                             bg="#5a1d1d", fg="#ffffff", pady=4)
-    status = tk.Label(root, text="Plug in a board…", font=("Helvetica", 18, "bold"),
+    status = tk.Label(root, text="Auto-flash is OFF", font=("Helvetica", 18, "bold"),
                       bg="#111418", fg="#e6e6e6", pady=10)
     status.pack(fill="x")
     counter = tk.Label(root, text="Flashed this session: 0",
@@ -898,6 +900,42 @@ def run_gui(cfg):
     tk.OptionMenu(top, product_var, *products.keys()).pack(side="left", padx=6)
     variant_var = tk.StringVar(value="")
     variant_menu_holder = tk.Frame(top, bg="#111418"); variant_menu_holder.pack(side="left")
+
+    # The auto-flash switch, drawn rather than a Checkbutton: a stock button
+    # ignores its colours on macOS, and this has to read ON/OFF at a glance.
+    auto_holder = tk.Frame(top, bg="#111418"); auto_holder.pack(side="right")
+    auto_lbl = tk.Label(auto_holder, text="", font=("Helvetica", 12, "bold"),
+                        bg="#111418", cursor="hand2")
+    auto_lbl.pack(side="left", padx=(0, 6))
+    auto_sw = tk.Canvas(auto_holder, width=44, height=24, bg="#111418",
+                        highlightthickness=0, cursor="hand2")
+    auto_sw.pack(side="left")
+
+    def draw_auto():
+        on = state["auto"]
+        track = "#3fb950" if on else "#6e7681"
+        auto_sw.delete("all")
+        auto_sw.create_oval(2, 2, 22, 22, fill=track, outline=track)
+        auto_sw.create_oval(22, 2, 42, 22, fill=track, outline=track)
+        auto_sw.create_rectangle(12, 2, 32, 22, fill=track, outline=track)
+        knob = 24 if on else 4
+        auto_sw.create_oval(knob, 4, knob + 16, 20, fill="#ffffff", outline="")
+        auto_lbl.config(text=f"Auto-flash: {'ON' if on else 'OFF'}",
+                        fg="#3fb950" if on else "#9aa0a6")
+
+    def toggle_auto(_=None):
+        state["auto"] = not state["auto"]
+        draw_auto()
+        if state["auto"]:
+            log("— auto-flash ON: boards are flashed as they're plugged in —")
+        else:
+            log("— auto-flash OFF: nothing is flashed until you turn it on or click Flash now —")
+        if not state["busy"] and not state["bench"]:
+            set_status("Plug in a board…" if state["auto"] else "Auto-flash is OFF", "#e6e6e6")
+
+    auto_lbl.bind("<Button-1>", toggle_auto)
+    auto_sw.bind("<Button-1>", toggle_auto)
+    draw_auto()
 
     opts = tk.Frame(root, bg="#111418"); opts.pack(fill="x", padx=12, pady=(4, 0))
     reset_var = tk.BooleanVar(value=False)
@@ -920,11 +958,6 @@ def run_gui(cfg):
 
     controls = tk.Frame(root, bg="#111418")
     controls.pack(fill="x", padx=12, pady=(0, 12))
-    auto_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(controls, text="Auto-flash on plug-in", variable=auto_var,
-                   bg="#111418", fg="#c9d1d9", selectcolor="#111418",
-                   activebackground="#111418", activeforeground="#c9d1d9",
-                   command=lambda: state.update(auto=auto_var.get())).pack(side="left")
     force_var = tk.StringVar(value="Auto")
     force_lbl = tk.Label(controls, text="  Force:", bg="#111418", fg="#9aa0a6")
     force_menu = tk.OptionMenu(controls, force_var, "Auto", "VAL3000", "VAL3100")
@@ -1053,14 +1086,17 @@ def run_gui(cfg):
 
     def worker():
         while True:
-            if state["auto"] and not state["busy"] and not state["bench"]:
+            if not state["busy"] and not state["bench"]:
                 present = set(list_ports())
+                # Forget unplugged ports even while auto-flash is off, so a board
+                # swapped in on the same port is new when the switch goes on.
                 for p in list(state["handled"]):
                     if p not in present:
                         del state["handled"][p]
-                for p in present:
-                    if p not in state["handled"]:
-                        do_one_flash(p); break
+                if state["auto"]:
+                    for p in present:
+                        if p not in state["handled"]:
+                            do_one_flash(p); break
             time.sleep(0.8)
 
     def manual_flash():
@@ -1197,7 +1233,9 @@ def run_gui(cfg):
         else:
             sync_firmware(state["product"], pcfg(), log)
         refresh_version()
-        log("Ready. Plug in a board.")
+        log("Ready. Plug in a board." if state["auto"] else
+            "Ready. Auto-flash is OFF — switch it on (top right) to flash boards as "
+            "they're plugged in, or click Flash now.")
     refresh_layout()
     threading.Thread(target=startup, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
