@@ -512,6 +512,74 @@ class ReleaseChecks(Rig):
         self.assertEqual((rec["tag"], rec["prerelease"]), ("v99", False))
         self.assertEqual(vf.bench_board("COMX", self.session()), "DONE")
 
+    def windows_locks(self, files_locked_for=0, locked_file=None):
+        """What OneDrive (or a virus scanner) does on Windows: deleting or renaming the
+        variant FOLDER is refused with Access is denied, and a freshly written file
+        can be held for a moment -- `files_locked_for` refusals per file, or for good
+        for `locked_file`. The 2026-10-20 bench report: '[WinError 5] Access is
+        denied: ...firmware\\Blipscope\\Kit_S3_1.28in_s3-128'."""
+        from unittest import mock
+        vdir = os.path.normcase(os.path.abspath(self.vdir))
+        denied = lambda p: os.path.normcase(os.path.abspath(str(p))) == vdir
+
+        def refuse(real):
+            def f(*a, **k):
+                if any(denied(x) for x in a[:2]):
+                    raise PermissionError(13, "Access is denied", self.vdir)
+                return real(*a, **k)
+            return f
+        tries = {}
+        real_copyfile = shutil.copyfile
+
+        def copyfile(src, dst, *a, **k):
+            name = os.path.basename(dst)
+            tries[name] = tries.get(name, 0) + 1
+            if name == locked_file or tries[name] <= files_locked_for:
+                raise PermissionError(13, "Access is denied", dst)
+            return real_copyfile(src, dst, *a, **k)
+        vf.RETRY_WAIT = 0
+        self.addCleanup(setattr, vf, "RETRY_WAIT", 0.5)
+        return [mock.patch.object(vf.shutil, "rmtree", refuse(shutil.rmtree)),
+                mock.patch.object(vf.shutil, "move", refuse(shutil.move)),
+                mock.patch.object(vf.os, "rename", refuse(os.rename)),
+                mock.patch.object(vf.shutil, "copyfile", copyfile)]
+
+    def with_locks(self, patches, fn):
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return fn()
+
+    def test_a_folder_windows_wont_delete_or_rename_still_updates(self):
+        make_variant(self.vdir, app_extra=b"an older release")          # what's there now: v98
+        with open(os.path.join(self.vdir, vf.RELEASE_RECORD), "w") as f:
+            json.dump({"tag": "v98", "prerelease": False}, f)
+        open(os.path.join(self.vdir, "factory-scan-old.json"), "w").write('{"public_runs": ["x"]}')
+        self.assertEqual(self.with_locks(self.windows_locks(), self.sync), "v99", self.msgs)
+        self.assertEqual(vf.read_release_record(self.vdir)["tag"], "v99")
+        self.assertEqual(open(os.path.join(self.vdir, ".release_tag")).read(), "v99", "the window shows this")
+        self.assertIsNotNone(vf.check_variant_dir(self.vdir, self.vcfg)[0])
+        self.assertFalse(os.path.exists(os.path.join(self.vdir, "factory-scan-old.json")),
+                         "nothing from an older release stays beside the new one")
+        self.assertEqual(vf.bench_board("COMX", self.session()), "DONE")
+
+    def test_a_first_download_into_a_watched_folder_installs(self):
+        self.assertEqual(self.with_locks(self.windows_locks(files_locked_for=2), self.sync), "v99", self.msgs)
+        self.assertIsNone(vf.release_refusal(self.vdir, False, bench=True))
+
+    def test_a_file_locked_for_good_installs_nothing_a_board_can_get(self):
+        patches = self.windows_locks(locked_file="firmware-s3-128.bin")
+        self.assertIsNone(self.with_locks(patches, self.sync))
+        self.assertTrue(any("download refused" in m for m in self.msgs), self.msgs)
+        self.assertIsNotNone(vf.release_refusal(self.vdir, False, bench=False))
+        self.assertEqual(vf.bench_board("COMX", self.session()), "FAILED")
+        self.assertEqual(self.writes(), [])
+
+    def test_nothing_downloaded_says_so_instead_of_blaming_an_old_cache(self):
+        why = vf.release_refusal(self.vdir, False, bench=False)
+        self.assertIn("no firmware downloaded", why)
+        self.assertNotIn("synced before release checks", why)
+
     def test_app_region_not_named_firmware_slug_is_refused(self):
         self.rename_app("app-s3-128.bin")
         # the release's OTA binary is now something else; the manifest set stays self-consistent
