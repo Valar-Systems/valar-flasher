@@ -52,7 +52,7 @@ tries is added to flash-log.csv. Runs a small Tk window; falls back to a console
 loop if Tk is unavailable. Requires esptool (the launcher installs it for you).
 """
 import os, sys, json, subprocess, threading, queue, time, urllib.request
-import base64, csv, hashlib, re, shutil, tempfile
+import base64, csv, hashlib, re, shutil, stat, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FW_ROOT = os.path.join(HERE, "firmware")
@@ -418,6 +418,9 @@ def release_refusal(vdir, local, bench):
         return ("bench mode writes a tagged release, never a local build" if bench else None)
     rec = read_release_record(vdir)
     if rec is None:
+        if not os.path.isdir(vdir) or not any(n.startswith("flash-manifest-") for n in os.listdir(vdir)):
+            return ("no firmware downloaded for this variant yet -- see the log for why the download "
+                    "failed, then click Update firmware")
         return "no release record for this image set (synced before release checks) -- Update firmware"
     if rec.get("prerelease") and not ALLOW_PRERELEASE:
         return f"{rec['tag']} is a PRERELEASE -- not written without --allow-prerelease"
@@ -478,6 +481,68 @@ def check_variant_dir(vdir, vcfg=None):
     return m, None
 
 
+# Windows: OneDrive and virus scanners hold a file (and its folder) for a moment
+# after it is written, and refuse to let it be replaced, deleted or renamed --
+# "[WinError 5] Access is denied". A short retry gets past a moment's hold.
+RETRY_WAIT = 0.5
+
+
+def _retry(fn, *args, tries=10):
+    for i in range(tries):
+        try:
+            return fn(*args)
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(RETRY_WAIT)
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except PermissionError:
+        os.chmod(path, stat.S_IWRITE)       # a read-only file can't be removed on Windows
+        os.remove(path)
+
+
+def _put(src, dst):
+    if os.path.exists(dst):
+        _remove(dst)
+    shutil.copyfile(src, dst)
+
+
+def install_image_set(src, vdir, vcfg, tag, record):
+    """Copy a checked image set from `src` into `vdir`, file by file, then write its
+    release record. The variant FOLDER is never deleted or renamed: on a folder that
+    OneDrive or a virus scanner is watching, Windows refuses that with Access is
+    denied for a while after its files were written (the 2026-10-20 bench report).
+    The record is removed first and written last, after the installed copy passes
+    its manifest check again, so an install that stops halfway leaves a set that
+    every write refuses -- never a half-new one."""
+    os.makedirs(vdir, exist_ok=True)
+    meta = (RELEASE_RECORD, ".release_tag")
+    for name in meta:
+        if os.path.exists(os.path.join(vdir, name)):
+            _retry(_remove, os.path.join(vdir, name))
+    names = set(os.listdir(src)) - set(meta)
+    for name in os.listdir(vdir):
+        # nothing from an older release stays beside the new one (an old scan
+        # report would widen what the secret scan accepts)
+        if name not in names and os.path.isfile(os.path.join(vdir, name)):
+            _retry(_remove, os.path.join(vdir, name))
+    for name in sorted(names):
+        _retry(_put, os.path.join(src, name), os.path.join(vdir, name))
+    man, why = check_variant_dir(vdir, vcfg)
+    if man is None:
+        raise RuntimeError(f"the installed copy failed its check ({why})")
+
+    def write(name, text):
+        with open(os.path.join(vdir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    _retry(write, ".release_tag", tag)
+    _retry(write, RELEASE_RECORD, json.dumps(record))
+
+
 def sync_variant(product, vname, vcfg, log, force=False):
     """Download a variant's manifest, every file it names and the scan report,
     check them all, and only then replace the cache. Never fails hard: offline or
@@ -505,7 +570,14 @@ def sync_variant(product, vname, vcfg, log, force=False):
         log(f"  {vcfg['repo']} {tag} has no {vcfg['manifest']} — this release predates "
             f"flash manifests. Keeping the cache ({cached or 'none'}).")
         return cached
-    tmp = tempfile.mkdtemp(prefix="vf-", dir=fw_dir(product) if os.path.isdir(fw_dir(product)) else None)
+    # Staged in the system's temp folder, not beside the cache, where a folder
+    # OneDrive syncs starts uploading every file the moment it is written. Clear out
+    # the staging folders older versions left beside the cache when a swap failed.
+    if os.path.isdir(fw_dir(product)):
+        for n in os.listdir(fw_dir(product)):
+            if n.startswith("vf-"):
+                shutil.rmtree(os.path.join(fw_dir(product), n), ignore_errors=True)
+    tmp = tempfile.mkdtemp(prefix="valar-flasher-")
     try:
         def fetch(name):
             if name not in by_name:
@@ -537,23 +609,18 @@ def sync_variant(product, vname, vcfg, log, force=False):
         app = [r for r in m["regions"] if r.get("name") == "app"]
         if len(app) != 1 or app[0].get("file") != ota:
             raise RuntimeError(f"the manifest's app region is not {ota}, the binary {tag} ships to devices")
-        with open(os.path.join(tmp, ".release_tag"), "w") as f:
-            f.write(tag)
-        with open(os.path.join(tmp, RELEASE_RECORD), "w", encoding="utf-8") as f:
-            json.dump({"tag": tag, "prerelease": prerelease, "app_sha256": app[0]["sha256"]}, f)
-        if os.path.isdir(vdir):
-            shutil.rmtree(vdir)
-        os.makedirs(os.path.dirname(vdir), exist_ok=True)
-        shutil.move(tmp, vdir)
-        tmp = None
+        install_image_set(tmp, vdir, vcfg, tag,
+                          {"tag": tag, "prerelease": prerelease, "app_sha256": app[0]["sha256"]})
         log(f"{vname} updated to {tag}.")
         return tag
     except Exception as e:
         log(f"  {vname} download refused: {e}. Keeping the cache ({cached or 'none'}).")
+        if isinstance(e, PermissionError):
+            log(f"  Windows wouldn't let the flasher write in {vdir}. Close any window showing that "
+                f"folder, or delete it, then click Update firmware.")
         return cached
     finally:
-        if tmp and os.path.isdir(tmp):
-            shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def variant_source(product, vname, vcfg):

@@ -137,6 +137,11 @@ tell them apart — a C6 board gets the C6 firmware of the selected product. Use
   cable.
 - **macOS "unidentified developer"** → right-click the `.command` → Open → Open
   (first time only).
+- **"download refused: [WinError 5] Access is denied"** → Windows (usually the virus
+  scanner, or OneDrive) briefly locks freshly downloaded files. The flasher retries
+  and installs file by file, so this should clear itself; if it doesn't, close any
+  Explorer window showing the `firmware` folder, delete `firmware\<Product>`, and
+  click **Update firmware**.
 - **Linux permission denied on the port** → `sudo usermod -aG dialout $USER`,
   then log out/in.
 
